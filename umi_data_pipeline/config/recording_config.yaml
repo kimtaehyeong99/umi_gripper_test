@@ -1,0 +1,30 @@
+# UMI Data Pipeline Recording Configuration
+
+# Camera settings
+camera:
+  rgb_topic: "/camera/camera/color/image_rect_raw"
+  depth_topic: "/camera/camera/aligned_depth_to_color/image_raw"
+  camera_info_topic: "/camera/camera/color/camera_info"
+  fps: 30
+  width: 640
+  height: 480
+
+# Gripper settings
+gripper:
+  topic: "/trigger_position_controller/commands"
+  topic_type: "std_msgs/msg/Float64MultiArray"
+  # Calibration: motor position to gripper width (meters)
+  min_position: 0.0       # Fully closed motor position
+  max_position: 1.0       # Fully open motor position
+  min_width: 0.0          # Fully closed width (m)
+  max_width: 0.08         # Fully open width (m)
+
+# SLAM settings
+slam:
+  vocabulary_path: "orb_slam3/Vocabulary/ORBvoc.txt.bin"
+  settings_file: "orb_slam3/config/RGBD/RealSense_D405.yaml"
+
+# Output settings
+output:
+  image_size: [224, 224]  # UMI default image size
+  fps: 30                 # Target FPS for output

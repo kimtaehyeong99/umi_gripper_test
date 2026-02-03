@@ -1,0 +1,6 @@
+[submodule "ros2_orb_slam3"]
+	path = ros2_orb_slam3
+	url = ../ros2_orb_slam3
+[submodule "dynamixel_hardware_interface_demos"]
+	path = dynamixel_hardware_interface_demos
+	url = https://github.com/robotis-git/dynamixel_hardware_interface_demos.git
