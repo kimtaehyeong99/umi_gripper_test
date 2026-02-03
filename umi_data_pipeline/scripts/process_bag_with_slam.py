@@ -62,8 +62,8 @@ class BagProcessor:
         """Load configuration from yaml file."""
         default_config = {
             'camera': {
-                'rgb_topic': '/camera/camera/color/image_rect_raw',
-                'depth_topic': '/camera/camera/aligned_depth_to_color/image_raw',
+                'rgb_topic': '/camera/camera/color/image_rect_raw/compressed',
+                'depth_topic': '/camera/camera/aligned_depth_to_color/image_raw/compressedDepth',
                 'camera_info_topic': '/camera/camera/color/camera_info',
                 'fps': 30,
             },
@@ -372,7 +372,7 @@ class BagProcessor:
         print(f"RMW_IMPLEMENTATION: {env.get('RMW_IMPLEMENTATION', 'not set')}")
 
         # Start SLAM node in subprocess (viewer MUST be disabled for subprocess compatibility)
-        slam_cmd = "ros2 run ros2_orb_slam3 rgbd_node_cpp --ros-args -p settings_name:=RealSense_D405 -p rgb_topic:=/camera/camera/color/image_rect_raw -p depth_topic:=/camera/camera/aligned_depth_to_color/image_raw -p enable_viewer:=false"
+        slam_cmd = "ros2 run ros2_orb_slam3 rgbd_node_cpp --ros-args -p settings_name:=RealSense_D405 -p rgb_topic:=/camera/camera/color/image_rect_raw/compressed -p depth_topic:=/camera/camera/aligned_depth_to_color/image_raw/compressedDepth -p enable_viewer:=false"
         print(f"Starting SLAM node: {slam_cmd}")
         slam_process = subprocess.Popen(
             slam_cmd,

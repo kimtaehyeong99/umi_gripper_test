@@ -47,8 +47,8 @@ cd ~/umi_ws/src/umi_gripper_test/umi_data_pipeline
 **녹화 토픽:**
 | 토픽 | 용도 |
 |------|------|
-| `/camera/camera/color/image_rect_raw` | RGB 이미지 |
-| `/camera/camera/aligned_depth_to_color/image_raw` | Depth 이미지 |
+| `/camera/camera/color/image_rect_raw/compressed` | RGB 이미지 |
+| `/camera/camera/aligned_depth_to_color/image_raw/compressedDepth` | Depth 이미지 |
 | `/camera/camera/color/camera_info` | 카메라 파라미터 |
 | `/gripper_position_controller/commands` | Gripper Action (명령값) |
 | `/joint_states` | Gripper Observation (실제 상태) |
@@ -186,8 +186,8 @@ nvidia-smi
 `config/recording_config.yaml`:
 ```yaml
 camera:
-  rgb_topic: "/camera/camera/color/image_rect_raw"
-  depth_topic: "/camera/camera/aligned_depth_to_color/image_raw"
+  rgb_topic: "/camera/camera/color/image_rect_raw/compressed"
+  depth_topic: "/camera/camera/aligned_depth_to_color/image_raw/compressedDepth"
   camera_info_topic: "/camera/camera/color/camera_info"
   fps: 30
 

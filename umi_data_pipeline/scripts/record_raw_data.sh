@@ -26,8 +26,8 @@ echo "Output:  ${OUTPUT_PATH}"
 echo "======================================"
 echo ""
 echo "Recording topics:"
-echo "  - /camera/camera/color/image_rect_raw (RGB)"
-echo "  - /camera/camera/aligned_depth_to_color/image_raw (Depth)"
+echo "  - /camera/camera/color/image_rect_raw/compressed (RGB)"
+echo "  - /camera/camera/aligned_depth_to_color/image_raw/compressedDepth (Depth)"
 echo "  - /camera/camera/color/camera_info (Camera Info)"
 echo "  - /gripper_position_controller/commands (Gripper Action)"
 echo "  - /joint_states (Gripper Observation)"
@@ -37,8 +37,8 @@ echo "======================================"
 
 # Record topics
 ros2 bag record -o "$OUTPUT_PATH" \
-  /camera/camera/color/image_rect_raw \
-  /camera/camera/aligned_depth_to_color/image_raw \
+  /camera/camera/color/image_rect_raw/compressed \
+  /camera/camera/aligned_depth_to_color/image_raw/compressedDepth \
   /camera/camera/color/camera_info \
   /gripper_position_controller/commands \
   /joint_states
