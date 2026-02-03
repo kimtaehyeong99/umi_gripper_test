@@ -29,10 +29,12 @@ import yaml
 # ROS2 bag reading
 try:
     from rosbags.rosbag2 import Reader
-    from rosbags.serde import deserialize_cdr
+    from rosbags.typesys import Stores, get_typestore
+    typestore = get_typestore(Stores.ROS2_HUMBLE)
     ROSBAGS_AVAILABLE = True
 except ImportError:
     ROSBAGS_AVAILABLE = False
+    typestore = None
     print("Warning: rosbags not installed. Install with: pip install rosbags")
 
 
@@ -114,7 +116,7 @@ class BagProcessor:
                 ts_sec = timestamp / 1e9  # Convert to seconds
 
                 if topic == rgb_topic:
-                    msg = deserialize_cdr(rawdata, conn.msgtype)
+                    msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
                     img = self._decode_image(msg, 'rgb8')
                     if img is not None:
                         frame_idx = len(rgb_data)
@@ -127,7 +129,7 @@ class BagProcessor:
                         })
 
                 elif topic == depth_topic:
-                    msg = deserialize_cdr(rawdata, conn.msgtype)
+                    msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
                     depth = self._decode_depth(msg)
                     if depth is not None:
                         frame_idx = len(depth_data)
@@ -140,7 +142,7 @@ class BagProcessor:
                         })
 
                 elif topic == gripper_topic:
-                    msg = deserialize_cdr(rawdata, conn.msgtype)
+                    msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
                     width = self._decode_gripper(msg)
                     gripper_data.append({
                         'timestamp': ts_sec,
@@ -148,7 +150,7 @@ class BagProcessor:
                     })
 
                 elif topic == self.config['camera']['camera_info_topic'] and camera_info is None:
-                    msg = deserialize_cdr(rawdata, conn.msgtype)
+                    msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
                     camera_info = {
                         'width': msg.width,
                         'height': msg.height,
