@@ -1,18 +1,18 @@
 # UMI Data Pipeline
 
-RealSense D405 + Dynamixel 그리퍼 환경에서 UMI/LeRobot 호환 데이터셋을 생성하는 ROS2 패키지
+RealSense D405 + Dynamixel 그리퍼 환경에서 UMI(Universal Manipulation Interface) 호환 데이터셋을 생성하는 ROS2 패키지
 
-## 워크플로우 (3단계)
+## 개요
 
 ```
-[1단계: 데이터 취득]
-RGB + Depth + Gripper → ROS2 bag (raw 데이터)
+[Stage 1: 데이터 녹화]
+RGB + Depth + Gripper Commands + Joint States → ROS2 Bag
 
-[2단계: 데이터 정합]
-ROS2 bag → 오프라인 SLAM → HDF5
+[Stage 2: SLAM 처리]
+ROS2 Bag → ORB-SLAM3 → HDF5 (with camera poses)
 
-[3단계: 데이터 변환]
-HDF5 → Zarr (UMI) / LeRobot
+[Stage 3: 형식 변환]
+HDF5 → UMI Zarr (학습용)
 ```
 
 ## 설치
@@ -21,50 +21,52 @@ HDF5 → Zarr (UMI) / LeRobot
 
 ```bash
 # Python 패키지
-pip install rosbags zarr h5py scipy imageio opencv-python
+pip install rosbags zarr h5py scipy imageio opencv-python numcodecs blosc
 
 # ROS2 빌드
 cd ~/umi_ws
-colcon build --packages-select umi_data_pipeline
+colcon build --packages-select umi_data_pipeline ros2_orb_slam3
 source install/setup.bash
 ```
 
 ## 사용법
 
-### 1단계: 데이터 취득
+### Stage 1: 데이터 녹화
 
 ```bash
-# 터미널 1: 카메라 + 그리퍼 실행
-ros2 launch umi_data_pipeline data_collection.launch.py
+# 터미널 1: 카메라 + 그리퍼 하드웨어 실행
+ros2 launch realsense2_camera rs_launch.py
+ros2 launch dynamixel_hardware_interface_demos gripper.launch.py
 
-# 터미널 2: 레코딩
+# 터미널 2: 녹화 시작
 cd ~/umi_ws/src/umi_gripper_test/umi_data_pipeline
-./scripts/record_raw_data.sh demo_001
+./scripts/record_raw_data.sh session_01
 # Ctrl+C로 종료
 ```
 
-**녹화되는 토픽:**
-| 토픽 | 타입 | 설명 |
-|------|------|------|
-| `/camera/camera/color/image_rect_raw` | Image | RGB 이미지 |
-| `/camera/camera/aligned_depth_to_color/image_raw` | Image | Depth 이미지 |
-| `/camera/camera/color/camera_info` | CameraInfo | 카메라 파라미터 |
-| `/trigger_position_controller/commands` | Float64MultiArray | 그리퍼 위치 |
+**녹화 토픽:**
+| 토픽 | 용도 |
+|------|------|
+| `/camera/camera/color/image_rect_raw` | RGB 이미지 |
+| `/camera/camera/aligned_depth_to_color/image_raw` | Depth 이미지 |
+| `/camera/camera/color/camera_info` | 카메라 파라미터 |
+| `/gripper_position_controller/commands` | Gripper Action (명령값) |
+| `/joint_states` | Gripper Observation (실제 상태) |
 
-**저장 위치:** `data/raw/demo_001/`
+**저장 위치:** `data/raw/session_01/`
 
-### 2단계: SLAM + HDF5 변환
+### Stage 2: SLAM 처리 + HDF5 변환
 
 ```bash
 python3 scripts/process_bag_with_slam.py \
-  --input data/raw/demo_001 \
-  --output data/processed/demo_001 \
+  --input data/raw/session_01 \
+  --output data/processed/session_01 \
   --config config/recording_config.yaml
 ```
 
-**출력 구조:**
+**출력:**
 ```
-data/processed/demo_001/
+data/processed/session_01/
 ├── rgb/                    # RGB 이미지 시퀀스
 ├── depth/                  # Depth 이미지 시퀀스
 ├── camera_trajectory.csv   # SLAM 카메라 궤적
@@ -72,47 +74,111 @@ data/processed/demo_001/
 └── dataset.hdf5            # 통합 HDF5 파일
 ```
 
-**HDF5 구조:**
-```
-dataset.hdf5
-├── episode_0000/
-│   ├── rgb_images        # (T, H, W, 3) uint8
-│   ├── depth_images      # (T, H, W) uint16 (mm)
-│   ├── camera_pose       # (T, 7) [x,y,z,qx,qy,qz,qw]
-│   ├── gripper_width     # (T,) float32 (meters)
-│   └── timestamps        # (T,) float64
-└── metadata/
+### 다중 세션 처리 (여러 bag 파일)
+
+```bash
+# 각 세션 처리
+python3 scripts/process_bag_with_slam.py --input data/raw/session_01 --output data/processed/session_01
+python3 scripts/process_bag_with_slam.py --input data/raw/session_02 --output data/processed/session_02
+python3 scripts/process_bag_with_slam.py --input data/raw/session_03 --output data/processed/session_03
+
+# HDF5 파일 병합
+python3 scripts/merge_hdf5.py \
+  --input-dir data/processed \
+  --output data/merged/dataset.hdf5
 ```
 
-### 3단계: 최종 형식 변환
+### Stage 3: UMI Zarr 변환
 
-**UMI Zarr 형식:**
 ```bash
 python3 scripts/convert_to_umi_zarr.py \
-  --input data/processed/demo_001/dataset.hdf5 \
-  --output data/datasets/umi_demo.zarr.zip \
-  --image-size 224 224
+  --input data/processed/session_01/dataset.hdf5 \
+  --output data/datasets/umi_demo.zarr.zip
+
+# 또는 병합된 파일 사용
+python3 scripts/convert_to_umi_zarr.py \
+  --input data/merged/dataset.hdf5 \
+  --output data/datasets/umi_demo.zarr.zip
 ```
 
-**LeRobot 형식:**
-```bash
-python3 scripts/convert_to_lerobot.py \
-  --input data/processed/demo_001/dataset.hdf5 \
-  --output data/datasets/lerobot_demo/
+## 데이터 형식
+
+### HDF5 구조 (중간 형식)
+
+```
+dataset.hdf5
+├── episode_000/
+│   ├── rgb_images        # [T, H, W, 3] uint8
+│   ├── depth_images      # [T, H, W] uint16 (mm)
+│   ├── camera_pose       # [T, 7] float32 [x,y,z,qx,qy,qz,qw]
+│   ├── gripper_width     # [T] float32 - Observation (실제 상태)
+│   ├── gripper_action    # [T] float32 - Action (명령값)
+│   └── timestamps        # [T] float64
+└── metadata/
+    └── config            # 설정 정보
 ```
 
-## UMI Zarr 출력 형식
+### UMI Zarr 구조 (학습용)
 
 ```
 dataset.zarr.zip/
 ├── data/
-│   ├── robot0_eef_pos           # (N, 3) 위치
-│   ├── robot0_eef_rot_axis_angle # (N, 6) 6D rotation
-│   ├── robot0_gripper_width     # (N, 1) 그리퍼 너비
-│   ├── camera0_rgb              # (N, 3, 224, 224) RGB
-│   └── action                   # (N, 10) 액션
+│   ├── robot0_eef_pos              # [N, 3] float32 - position (meters)
+│   ├── robot0_eef_rot_axis_angle   # [N, 3] float32 - axis-angle rotation
+│   ├── robot0_gripper_width        # [N, 1] float32 - gripper width (meters)
+│   ├── robot0_demo_start_pose      # [N, 6] float32 - episode start pose
+│   ├── robot0_demo_end_pose        # [N, 6] float32 - episode end pose
+│   ├── camera0_rgb                 # [N, 224, 224, 3] uint8 - HWC format
+│   └── action                      # [N, 10] float32 - pos(3) + rot6d(6) + gripper(1)
 └── meta/
-    └── episode_ends             # 에피소드 경계
+    └── episode_ends                # [episodes] int64 - cumulative indices
+```
+
+**회전 표현:**
+- `robot0_eef_rot_axis_angle`: axis-angle [3] 저장 → 학습 시 rot6d [6] 변환
+- `action`: rot6d [6] 직접 저장
+
+**Gripper 분리:**
+- `robot0_gripper_width`: Observation (실제 상태, `/joint_states`)
+- `action[:, 9]`: Action (명령값, `/gripper_position_controller/commands`)
+
+## 학습
+
+### 환경 설정 (RTX 5090/Blackwell GPU)
+
+```bash
+# Python 3.10 + PyTorch nightly (CUDA 12.8) 환경 생성
+conda create -n umi310 python=3.10
+conda activate umi310
+pip install --pre torch torchvision --index-url https://download.pytorch.org/whl/nightly/cu128
+
+# detached-umi-policy 의존성 설치
+cd ~/umi_ws/src/detached-umi-policy
+pip install -e .
+```
+
+### 학습 실행
+
+```bash
+cd ~/umi_ws/src/detached-umi-policy
+
+PYTHONPATH=/home/robotis-ai/umi_ws/src/detached-umi-policy:$PYTHONPATH \
+WANDB_MODE=disabled \
+python train.py \
+  --config-name=train_diffusion_unet_timm_umi_workspace \
+  task.dataset_path=/home/robotis-ai/umi_ws/src/umi_gripper_test/umi_data_pipeline/data/datasets/umi_demo.zarr.zip \
+  logging.mode=disabled \
+  training.num_epochs=120
+```
+
+### 학습 모니터링
+
+```bash
+# 체크포인트 확인 (loss 추이)
+ls ~/umi_ws/src/detached-umi-policy/data/outputs/*/checkpoints/*.ckpt
+
+# GPU 사용량 확인
+nvidia-smi
 ```
 
 ## 설정 파일
@@ -122,49 +188,42 @@ dataset.zarr.zip/
 camera:
   rgb_topic: "/camera/camera/color/image_rect_raw"
   depth_topic: "/camera/camera/aligned_depth_to_color/image_raw"
+  camera_info_topic: "/camera/camera/color/camera_info"
   fps: 30
 
 gripper:
-  topic: "/trigger_position_controller/commands"
-  min_width: 0.0    # 완전 닫힘 (m)
-  max_width: 0.08   # 완전 열림 (m)
+  action_topic: "/gripper_position_controller/commands"      # 명령값
+  observation_topic: "/joint_states"                         # 실제 상태
+  joint_name: "gripper"
+  min_position: 0.0
+  max_position: 1.0
+  min_width: 0.0
+  max_width: 0.08
+
+slam:
+  vocabulary_path: "orb_slam3/Vocabulary/ORBvoc.txt.bin"
+  settings_file: "orb_slam3/config/RGBD/RealSense_D405.yaml"
 
 output:
   image_size: [224, 224]
-```
-
-## 파일 구조
-
-```
-umi_data_pipeline/
-├── scripts/
-│   ├── record_raw_data.sh        # 1단계
-│   ├── process_bag_with_slam.py  # 2단계
-│   ├── convert_to_umi_zarr.py    # 3단계 (UMI)
-│   └── convert_to_lerobot.py     # 3단계 (LeRobot)
-├── launch/
-│   └── data_collection.launch.py
-├── config/
-│   └── recording_config.yaml
-├── data/                         # 데이터 저장 (gitignore)
-│   ├── raw/                      # bag 파일
-│   ├── processed/                # HDF5 파일
-│   └── datasets/                 # Zarr/LeRobot
-└── umi_data_pipeline/            # Python 모듈
-    └── __init__.py
+  fps: 30
 ```
 
 ## 검증
 
 ```bash
-# bag 파일 확인
-ros2 bag info data/raw/demo_001/
+# Bag 파일 확인
+ros2 bag info data/raw/session_01/
 
 # HDF5 확인
 python3 -c "
 import h5py
-with h5py.File('data/processed/demo_001/dataset.hdf5', 'r') as f:
-    print(list(f.keys()))
+with h5py.File('data/processed/session_01/dataset.hdf5', 'r') as f:
+    for key in f.keys():
+        if key.startswith('episode'):
+            print(f'{key}:')
+            for k, v in f[key].items():
+                print(f'  {k}: {v.shape}')
 "
 
 # Zarr 확인
@@ -172,11 +231,64 @@ python3 -c "
 import zarr
 z = zarr.open('data/datasets/umi_demo.zarr.zip')
 print(z.tree())
+print('eef_rot shape:', z['data/robot0_eef_rot_axis_angle'].shape)  # [N, 3]
+print('rgb shape:', z['data/camera0_rgb'].shape)  # [N, 224, 224, 3]
+print('action shape:', z['data/action'].shape)  # [N, 10]
 "
 ```
 
-## 주의사항
+## 파일 구조
 
-1. **SLAM**: 현재 `process_bag_with_slam.py`는 placeholder 포즈를 생성함. 실제 ORB-SLAM3 연동 필요
-2. **그리퍼 캘리브레이션**: `recording_config.yaml`에서 `min_position/max_position` → `min_width/max_width` 매핑 설정 필요
-3. **에피소드 분할**: 현재 전체를 하나의 에피소드로 처리. 수동/자동 분할 기능 추가 예정
+```
+umi_data_pipeline/
+├── scripts/
+│   ├── record_raw_data.sh        # Stage 1: 데이터 녹화
+│   ├── process_bag_with_slam.py  # Stage 2: SLAM + HDF5
+│   ├── merge_hdf5.py             # 다중 HDF5 병합
+│   ├── convert_to_umi_zarr.py    # Stage 3: UMI Zarr 변환
+│   └── convert_to_lerobot.py     # Stage 3: LeRobot 변환 (optional)
+├── launch/
+│   └── data_collection.launch.py
+├── config/
+│   └── recording_config.yaml
+├── data/                         # 데이터 저장 (gitignore)
+│   ├── raw/                      # ROS2 bag 파일
+│   ├── processed/                # HDF5 파일
+│   ├── merged/                   # 병합된 HDF5
+│   └── datasets/                 # Zarr/LeRobot
+└── umi_data_pipeline/
+    └── __init__.py
+```
+
+## 전체 파이프라인 예시
+
+```bash
+# 1. 데이터 녹화 (3개 세션)
+./scripts/record_raw_data.sh session_01
+./scripts/record_raw_data.sh session_02
+./scripts/record_raw_data.sh session_03
+
+# 2. 각 세션 처리 (SLAM 포함)
+for i in 01 02 03; do
+  python3 scripts/process_bag_with_slam.py \
+    --input data/raw/session_$i \
+    --output data/processed/session_$i
+done
+
+# 3. HDF5 병합
+python3 scripts/merge_hdf5.py \
+  --input-dir data/processed \
+  --output data/merged/dataset.hdf5
+
+# 4. UMI Zarr 변환
+python3 scripts/convert_to_umi_zarr.py \
+  --input data/merged/dataset.hdf5 \
+  --output data/datasets/umi_demo.zarr.zip
+
+# 5. 학습
+cd ~/umi_ws/src/detached-umi-policy
+conda activate umi310
+PYTHONPATH=$PWD:$PYTHONPATH python train.py \
+  --config-name=train_diffusion_unet_timm_umi_workspace \
+  task.dataset_path=~/umi_ws/src/umi_gripper_test/umi_data_pipeline/data/datasets/umi_demo.zarr.zip
+```

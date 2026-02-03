@@ -98,6 +98,4 @@ ros2 launch umi_data_pipeline data_collection.launch.py
    - Option A: ros2 bag play + SLAM 노드 실행 후 trajectory 파일 읽기
    - Option B: Python에서 직접 이미지 처리 + SLAM 라이브러리 호출
 
-2. 그리퍼 캘리브레이션 스크립트 작성
-
-3. 실제 데이터 수집 테스트
+2. 실제 데이터 수집 테스트

@@ -3,12 +3,14 @@
 UMI Data Pipeline - Convert HDF5 to UMI Zarr Format
 
 This script converts the processed HDF5 data to UMI-compatible Zarr format:
-- robot0_eef_pos: [3] End-effector position
-- robot0_eef_rot_axis_angle: [6] 6D rotation representation
-- robot0_gripper_width: [1] Gripper width
-- camera0_rgb: [3, 224, 224] RGB images
-- action: [10] = 3 pos + 6 rot6d + 1 gripper
-- episode_ends: Episode boundary indices
+- robot0_eef_pos: [N, 3] End-effector position (meters)
+- robot0_eef_rot_axis_angle: [N, 3] Rotation as axis-angle (rotvec)
+- robot0_gripper_width: [N, 1] Gripper width (meters)
+- robot0_demo_start_pose: [N, 6] Episode start pose (pos + axis_angle)
+- robot0_demo_end_pose: [N, 6] Episode end pose (pos + axis_angle)
+- camera0_rgb: [N, H, W, 3] RGB images (HWC format)
+- action: [N, 10] = pos(3) + rot6d(6) + gripper(1)
+- meta/episode_ends: Episode boundary indices
 
 Usage:
     python3 convert_to_umi_zarr.py --input data/processed/session/dataset.hdf5 --output data/datasets/umi_demo.zarr.zip
@@ -25,11 +27,11 @@ import h5py
 
 try:
     import zarr
-    from zarr import blosc
+    from numcodecs import Blosc
     ZARR_AVAILABLE = True
 except ImportError:
     ZARR_AVAILABLE = False
-    print("Warning: zarr not installed. Install with: pip install zarr")
+    print("Warning: zarr not installed. Install with: pip install 'zarr<3' numcodecs")
 
 try:
     from scipy.spatial.transform import Rotation
@@ -39,12 +41,33 @@ except ImportError:
     print("Warning: scipy not installed. Install with: pip install scipy")
 
 
+def quaternion_to_axis_angle(quat: np.ndarray) -> np.ndarray:
+    """
+    Convert quaternion to axis-angle (rotation vector) representation.
+
+    UMI stores rotations as axis-angle [3] in the Zarr file.
+
+    Args:
+        quat: Quaternion [x, y, z, w]
+
+    Returns:
+        Axis-angle [3] (rotation vector where magnitude is angle in radians)
+    """
+    if not SCIPY_AVAILABLE:
+        return np.zeros(3, dtype=np.float32)
+
+    # scipy uses [x, y, z, w] format
+    rotvec = Rotation.from_quat(quat).as_rotvec()
+    return rotvec.astype(np.float32)
+
+
 def quaternion_to_rotation_6d(quat: np.ndarray) -> np.ndarray:
     """
     Convert quaternion to 6D rotation representation.
 
     The 6D representation uses the first two columns of the rotation matrix,
     which is a continuous representation for rotations.
+    Used for action representation.
 
     Args:
         quat: Quaternion [x, y, z, w]
@@ -62,6 +85,26 @@ def quaternion_to_rotation_6d(quat: np.ndarray) -> np.ndarray:
     # 6D representation: first two columns of rotation matrix, flattened column-wise
     rot_6d = np.concatenate([R[:, 0], R[:, 1]])
 
+    return rot_6d.astype(np.float32)
+
+
+def axis_angle_to_rotation_6d(rotvec: np.ndarray) -> np.ndarray:
+    """
+    Convert axis-angle to 6D rotation representation.
+
+    Used for computing actions from stored axis-angle observations.
+
+    Args:
+        rotvec: Axis-angle [3]
+
+    Returns:
+        6D rotation [6]
+    """
+    if not SCIPY_AVAILABLE:
+        return np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0], dtype=np.float32)
+
+    R = Rotation.from_rotvec(rotvec).as_matrix()
+    rot_6d = np.concatenate([R[:, 0], R[:, 1]])
     return rot_6d.astype(np.float32)
 
 
@@ -96,23 +139,23 @@ def preprocess_image(img: np.ndarray, target_size: Tuple[int, int] = (224, 224))
     """
     Preprocess image for UMI format.
 
+    UMI uses HWC format (Height, Width, Channels).
+
     Args:
         img: RGB image [H, W, 3]
         target_size: Target size (width, height)
 
     Returns:
-        Preprocessed image [3, H, W] uint8
+        Preprocessed image [H, W, 3] uint8 (HWC format)
     """
-    # Resize
+    # Resize to target size
     img_resized = cv2.resize(img, target_size, interpolation=cv2.INTER_AREA)
 
-    # HWC -> CHW
-    img_chw = np.transpose(img_resized, (2, 0, 1))
-
-    return img_chw.astype(np.uint8)
+    # Keep HWC format (UMI standard)
+    return img_resized.astype(np.uint8)
 
 
-def compute_actions(positions: np.ndarray, rot_6ds: np.ndarray,
+def compute_actions(positions: np.ndarray, axis_angles: np.ndarray,
                     gripper_widths: np.ndarray) -> np.ndarray:
     """
     Compute actions from states.
@@ -120,15 +163,20 @@ def compute_actions(positions: np.ndarray, rot_6ds: np.ndarray,
     In UMI, actions are the state at time t+1 (absolute actions).
     Action: [pos(3), rot6d(6), gripper(1)] = 10 dims
 
+    Note: Observations store axis-angle [3], but actions use rot6d [6].
+
     Args:
         positions: [N, 3] End-effector positions
-        rot_6ds: [N, 6] 6D rotations
+        axis_angles: [N, 3] Axis-angle rotations
         gripper_widths: [N, 1] Gripper widths
 
     Returns:
-        actions: [N, 10] Actions
+        actions: [N, 10] Actions with rot6d representation
     """
     n_frames = len(positions)
+
+    # Convert axis-angles to rot6d for actions
+    rot_6ds = np.array([axis_angle_to_rotation_6d(aa) for aa in axis_angles])
 
     # Action is next state (shifted by 1)
     # For last frame, repeat the last action
@@ -138,7 +186,7 @@ def compute_actions(positions: np.ndarray, rot_6ds: np.ndarray,
         next_idx = min(i + 1, n_frames - 1)
         actions[i, :3] = positions[next_idx]
         actions[i, 3:9] = rot_6ds[next_idx]
-        actions[i, 9] = gripper_widths[next_idx]
+        actions[i, 9] = gripper_widths[next_idx].item() if gripper_widths[next_idx].ndim > 0 else gripper_widths[next_idx]
 
     return actions
 
@@ -174,9 +222,12 @@ class UMIZarrConverter:
 
             # Collect all data
             all_positions = []
-            all_rot_6ds = []
-            all_gripper_widths = []
+            all_axis_angles = []
+            all_gripper_observations = []  # Observation from /joint_states
+            all_gripper_actions = []       # Action from /gripper_position_controller/commands
             all_images = []
+            all_demo_start_poses = []
+            all_demo_end_poses = []
             episode_ends = []
 
             total_frames = 0
@@ -191,43 +242,66 @@ class UMIZarrConverter:
                 positions = poses[:, :3]
                 quaternions = poses[:, 3:7]
 
-                # Convert quaternions to 6D rotation
-                rot_6ds = np.array([quaternion_to_rotation_6d(q) for q in quaternions])
+                # Convert quaternions to axis-angle (UMI standard storage)
+                axis_angles = np.array([quaternion_to_axis_angle(q) for q in quaternions])
 
-                # Gripper widths
-                gripper_widths = episode['gripper_width'][:].reshape(-1, 1)
+                # Gripper observation (from /joint_states) - used for state observation
+                gripper_observations = episode['gripper_width'][:].reshape(-1, 1)
 
-                # Images - preprocess to target size
+                # Gripper action (from /commands) - used for action computation
+                if 'gripper_action' in episode:
+                    gripper_actions = episode['gripper_action'][:].reshape(-1, 1)
+                else:
+                    # Fallback: use observation if action not available
+                    gripper_actions = gripper_observations.copy()
+
+                # Images - preprocess to target size (HWC format)
                 rgb_images = episode['rgb_images'][:]
                 processed_images = np.array([
                     preprocess_image(img, self.image_size)
                     for img in rgb_images
                 ])
 
+                # Demo start/end poses [6] = pos(3) + axis_angle(3)
+                # Broadcast to all frames in episode
+                demo_start_pose = np.concatenate([positions[0], axis_angles[0]])
+                demo_end_pose = np.concatenate([positions[-1], axis_angles[-1]])
+                demo_start_poses = np.tile(demo_start_pose, (n_frames, 1))
+                demo_end_poses = np.tile(demo_end_pose, (n_frames, 1))
+
                 # Accumulate
                 all_positions.append(positions)
-                all_rot_6ds.append(rot_6ds)
-                all_gripper_widths.append(gripper_widths)
+                all_axis_angles.append(axis_angles)
+                all_gripper_observations.append(gripper_observations)
+                all_gripper_actions.append(gripper_actions)
                 all_images.append(processed_images)
+                all_demo_start_poses.append(demo_start_poses)
+                all_demo_end_poses.append(demo_end_poses)
 
                 total_frames += n_frames
                 episode_ends.append(total_frames)
 
             # Stack all episodes
             all_positions = np.concatenate(all_positions, axis=0).astype(np.float32)
-            all_rot_6ds = np.concatenate(all_rot_6ds, axis=0).astype(np.float32)
-            all_gripper_widths = np.concatenate(all_gripper_widths, axis=0).astype(np.float32)
+            all_axis_angles = np.concatenate(all_axis_angles, axis=0).astype(np.float32)
+            all_gripper_observations = np.concatenate(all_gripper_observations, axis=0).astype(np.float32)
+            all_gripper_actions = np.concatenate(all_gripper_actions, axis=0).astype(np.float32)
             all_images = np.concatenate(all_images, axis=0)
+            all_demo_start_poses = np.concatenate(all_demo_start_poses, axis=0).astype(np.float32)
+            all_demo_end_poses = np.concatenate(all_demo_end_poses, axis=0).astype(np.float32)
             episode_ends = np.array(episode_ends, dtype=np.int64)
 
-            # Compute actions
-            all_actions = compute_actions(all_positions, all_rot_6ds, all_gripper_widths)
+            # Compute actions using gripper_action (from commands), not gripper_observation
+            all_actions = compute_actions(all_positions, all_axis_angles, all_gripper_actions)
 
             print(f"\nTotal frames: {total_frames}")
             print(f"Positions shape: {all_positions.shape}")
-            print(f"Rotations shape: {all_rot_6ds.shape}")
-            print(f"Gripper shape: {all_gripper_widths.shape}")
+            print(f"Axis-angles shape: {all_axis_angles.shape}")
+            print(f"Gripper observation shape: {all_gripper_observations.shape}")
+            print(f"Gripper action shape: {all_gripper_actions.shape}")
             print(f"Images shape: {all_images.shape}")
+            print(f"Demo start poses shape: {all_demo_start_poses.shape}")
+            print(f"Demo end poses shape: {all_demo_end_poses.shape}")
             print(f"Actions shape: {all_actions.shape}")
             print(f"Episode ends: {episode_ends}")
 
@@ -243,54 +317,72 @@ class UMIZarrConverter:
         data = root.create_group('data')
 
         # Store arrays with compression
-        compressor = blosc.Blosc(cname='zstd', clevel=5, shuffle=blosc.SHUFFLE)
+        compressor = Blosc(cname='zstd', clevel=5, shuffle=Blosc.SHUFFLE)
 
         print("\nSaving to Zarr...")
 
-        # robot0_eef_pos
+        # robot0_eef_pos [N, 3]
         data.create_dataset(
             'robot0_eef_pos',
             data=all_positions,
             chunks=(1000, 3),
             compressor=compressor
         )
-        print("  - robot0_eef_pos")
+        print("  - robot0_eef_pos [N, 3]")
 
-        # robot0_eef_rot_axis_angle (using 6D representation)
+        # robot0_eef_rot_axis_angle [N, 3] - UMI stores as axis-angle
         data.create_dataset(
             'robot0_eef_rot_axis_angle',
-            data=all_rot_6ds,
-            chunks=(1000, 6),
+            data=all_axis_angles,
+            chunks=(1000, 3),
             compressor=compressor
         )
-        print("  - robot0_eef_rot_axis_angle")
+        print("  - robot0_eef_rot_axis_angle [N, 3]")
 
-        # robot0_gripper_width
+        # robot0_gripper_width [N, 1] - Observation from /joint_states
         data.create_dataset(
             'robot0_gripper_width',
-            data=all_gripper_widths,
+            data=all_gripper_observations,
             chunks=(1000, 1),
             compressor=compressor
         )
-        print("  - robot0_gripper_width")
+        print("  - robot0_gripper_width [N, 1] (observation)")
 
-        # camera0_rgb (large, use chunking)
+        # robot0_demo_start_pose [N, 6] = pos(3) + axis_angle(3)
+        data.create_dataset(
+            'robot0_demo_start_pose',
+            data=all_demo_start_poses,
+            chunks=(1000, 6),
+            compressor=compressor
+        )
+        print("  - robot0_demo_start_pose [N, 6]")
+
+        # robot0_demo_end_pose [N, 6] = pos(3) + axis_angle(3)
+        data.create_dataset(
+            'robot0_demo_end_pose',
+            data=all_demo_end_poses,
+            chunks=(1000, 6),
+            compressor=compressor
+        )
+        print("  - robot0_demo_end_pose [N, 6]")
+
+        # camera0_rgb [N, H, W, 3] - HWC format (UMI standard)
         data.create_dataset(
             'camera0_rgb',
             data=all_images,
-            chunks=(100, 3, self.image_size[1], self.image_size[0]),
+            chunks=(1, self.image_size[1], self.image_size[0], 3),
             compressor=compressor
         )
-        print("  - camera0_rgb")
+        print(f"  - camera0_rgb [N, {self.image_size[1]}, {self.image_size[0]}, 3]")
 
-        # action
+        # action [N, 10] = pos(3) + rot6d(6) + gripper(1)
         data.create_dataset(
             'action',
             data=all_actions,
             chunks=(1000, 10),
             compressor=compressor
         )
-        print("  - action")
+        print("  - action [N, 10]")
 
         # Create meta group
         meta = root.create_group('meta')

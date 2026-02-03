@@ -29,7 +29,8 @@ echo "Recording topics:"
 echo "  - /camera/camera/color/image_rect_raw (RGB)"
 echo "  - /camera/camera/aligned_depth_to_color/image_raw (Depth)"
 echo "  - /camera/camera/color/camera_info (Camera Info)"
-echo "  - /gripper_position_controller/commands (Gripper)"
+echo "  - /gripper_position_controller/commands (Gripper Action)"
+echo "  - /joint_states (Gripper Observation)"
 echo ""
 echo "Press Ctrl+C to stop recording"
 echo "======================================"
@@ -39,7 +40,8 @@ ros2 bag record -o "$OUTPUT_PATH" \
   /camera/camera/color/image_rect_raw \
   /camera/camera/aligned_depth_to_color/image_raw \
   /camera/camera/color/camera_info \
-  /gripper_position_controller/commands
+  /gripper_position_controller/commands \
+  /joint_states
 
 echo ""
 echo "Recording saved to: ${OUTPUT_PATH}"

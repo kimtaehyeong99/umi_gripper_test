@@ -17,6 +17,7 @@ import os
 import sys
 import json
 import subprocess
+import signal
 import tempfile
 import shutil
 from pathlib import Path
@@ -37,6 +38,19 @@ except ImportError:
     typestore = None
     print("Warning: rosbags not installed. Install with: pip install rosbags")
 
+# ROS2 for SLAM pose subscription
+try:
+    import rclpy
+    from rclpy.node import Node
+    from geometry_msgs.msg import PoseStamped
+    import threading
+    import time
+    import signal
+    RCLPY_AVAILABLE = True
+except ImportError:
+    RCLPY_AVAILABLE = False
+    print("Warning: rclpy not available. SLAM integration will use placeholder.")
+
 
 class BagProcessor:
     """Process ROS2 bag files for UMI dataset creation."""
@@ -54,7 +68,9 @@ class BagProcessor:
                 'fps': 30,
             },
             'gripper': {
-                'topic': '/trigger_position_controller/commands',
+                'action_topic': '/gripper_position_controller/commands',  # Action (command)
+                'observation_topic': '/joint_states',  # Observation (actual state)
+                'joint_name': 'gripper',  # Joint name in JointState message
                 'min_position': 0.0,
                 'max_position': 1.0,
                 'min_width': 0.0,
@@ -93,19 +109,21 @@ class BagProcessor:
 
         rgb_topic = self.config['camera']['rgb_topic']
         depth_topic = self.config['camera']['depth_topic']
-        gripper_topic = self.config['gripper']['topic']
+        gripper_action_topic = self.config['gripper']['action_topic']
+        gripper_obs_topic = self.config['gripper']['observation_topic']
 
         rgb_data = []
         depth_data = []
-        gripper_data = []
+        gripper_action_data = []  # From commands (action)
+        gripper_obs_data = []     # From joint_states (observation)
         camera_info = None
 
         with Reader(bag_path) as reader:
             # Get connections for our topics
             connections = {}
             for conn in reader.connections:
-                if conn.topic in [rgb_topic, depth_topic, gripper_topic,
-                                  self.config['camera']['camera_info_topic']]:
+                if conn.topic in [rgb_topic, depth_topic, gripper_action_topic,
+                                  gripper_obs_topic, self.config['camera']['camera_info_topic']]:
                     connections[conn.topic] = conn
 
             print(f"Found topics: {list(connections.keys())}")
@@ -141,13 +159,22 @@ class BagProcessor:
                             'frame_idx': frame_idx
                         })
 
-                elif topic == gripper_topic:
+                elif topic == gripper_action_topic:
                     msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
-                    width = self._decode_gripper(msg)
-                    gripper_data.append({
+                    width = self._decode_gripper_command(msg)
+                    gripper_action_data.append({
                         'timestamp': ts_sec,
                         'width': width
                     })
+
+                elif topic == gripper_obs_topic:
+                    msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
+                    width = self._decode_joint_states(msg)
+                    if width is not None:
+                        gripper_obs_data.append({
+                            'timestamp': ts_sec,
+                            'width': width
+                        })
 
                 elif topic == self.config['camera']['camera_info_topic'] and camera_info is None:
                     msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
@@ -158,12 +185,14 @@ class BagProcessor:
                         'D': list(msg.d),
                     }
 
-        print(f"Extracted: {len(rgb_data)} RGB, {len(depth_data)} Depth, {len(gripper_data)} Gripper frames")
+        print(f"Extracted: {len(rgb_data)} RGB, {len(depth_data)} Depth")
+        print(f"  Gripper: {len(gripper_obs_data)} observations, {len(gripper_action_data)} actions")
 
         return {
             'rgb': rgb_data,
             'depth': depth_data,
-            'gripper': gripper_data,
+            'gripper_observation': gripper_obs_data,  # From /joint_states
+            'gripper_action': gripper_action_data,    # From /gripper_position_controller/commands
             'camera_info': camera_info
         }
 
@@ -199,8 +228,8 @@ class BagProcessor:
             print(f"Error decoding depth: {e}")
             return None
 
-    def _decode_gripper(self, msg) -> float:
-        """Decode gripper message to width in meters."""
+    def _decode_gripper_command(self, msg) -> float:
+        """Decode gripper command message (Float64MultiArray) to width in meters."""
         try:
             # Float64MultiArray - take first element
             if hasattr(msg, 'data') and len(msg.data) > 0:
@@ -221,38 +250,300 @@ class BagProcessor:
 
             return float(width)
         except Exception as e:
-            print(f"Error decoding gripper: {e}")
+            print(f"Error decoding gripper command: {e}")
             return 0.0
 
-    def run_slam_offline(self, rgb_dir: str, depth_dir: str, output_dir: str) -> List[Dict]:
+    def _decode_joint_states(self, msg) -> Optional[float]:
+        """Decode JointState message to get gripper width in meters."""
+        try:
+            joint_name = self.config['gripper'].get('joint_name', 'gripper')
+
+            # Find the gripper joint in JointState message
+            if hasattr(msg, 'name') and hasattr(msg, 'position'):
+                for i, name in enumerate(msg.name):
+                    if joint_name in name:
+                        position = msg.position[i]
+
+                        # Convert position to width using calibration
+                        cfg = self.config['gripper']
+                        pos_range = cfg['max_position'] - cfg['min_position']
+                        width_range = cfg['max_width'] - cfg['min_width']
+
+                        if pos_range > 0:
+                            normalized = (position - cfg['min_position']) / pos_range
+                            width = cfg['min_width'] + normalized * width_range
+                        else:
+                            width = cfg['min_width']
+
+                        return float(width)
+
+            return None
+        except Exception as e:
+            print(f"Error decoding joint states: {e}")
+            return None
+
+    def run_slam_offline(self, rgb_dir: str, depth_dir: str, output_dir: str,
+                          rgb_data: List[Dict] = None, bag_path: str = None) -> List[Dict]:
         """
         Run ORB-SLAM3 offline on extracted images.
 
         This uses ros2 bag play + SLAM node approach.
-        Alternative: Direct image processing with ORB-SLAM3 library.
+
+        Args:
+            rgb_dir: Directory containing RGB images
+            depth_dir: Directory containing depth images
+            output_dir: Output directory for trajectory file
+            rgb_data: Optional list of RGB frame data with timestamps
+            bag_path: Path to the ROS2 bag file for replay
         """
         print("Running offline SLAM...")
 
-        # For now, create a placeholder trajectory
-        # In production, this would run ORB-SLAM3 on the images
+        # Check if we can run real SLAM
+        if not RCLPY_AVAILABLE or bag_path is None:
+            print("SLAM not available, using placeholder poses...")
+            return self._generate_placeholder_trajectory(rgb_dir, rgb_data, output_dir)
 
+        try:
+            trajectory = self._run_slam_with_bag_replay(bag_path, rgb_data, output_dir)
+            if len(trajectory) == 0:
+                print("SLAM failed, falling back to placeholder poses...")
+                return self._generate_placeholder_trajectory(rgb_dir, rgb_data, output_dir)
+            return trajectory
+        except Exception as e:
+            print(f"SLAM error: {e}")
+            print("Falling back to placeholder poses...")
+            return self._generate_placeholder_trajectory(rgb_dir, rgb_data, output_dir)
+
+    def _run_slam_with_bag_replay(self, bag_path: str, rgb_data: List[Dict],
+                                   output_dir: str) -> List[Dict]:
+        """
+        Run SLAM by playing back the bag file and collecting poses.
+        """
+        print("Starting SLAM with bag replay...")
+
+        # Resolve absolute path for bag file
+        bag_path = str(Path(bag_path).resolve())
+        print(f"Bag path (absolute): {bag_path}")
+
+        collected_poses = []
+        slam_ready = threading.Event()
+        bag_finished = threading.Event()
+
+        # Initialize rclpy
+        rclpy.init()
+
+        class PoseCollector(Node):
+            def __init__(self):
+                super().__init__('pose_collector')
+                self.poses = []
+                self.subscription = self.create_subscription(
+                    PoseStamped,
+                    '/orb_slam3/camera_pose',
+                    self.pose_callback,
+                    10
+                )
+                self.get_logger().info('Pose collector initialized')
+
+            def pose_callback(self, msg):
+                timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9
+                pose_data = {
+                    'timestamp': timestamp,
+                    'position': [
+                        msg.pose.position.x,
+                        msg.pose.position.y,
+                        msg.pose.position.z
+                    ],
+                    'quaternion': [
+                        msg.pose.orientation.x,
+                        msg.pose.orientation.y,
+                        msg.pose.orientation.z,
+                        msg.pose.orientation.w
+                    ]
+                }
+                self.poses.append(pose_data)
+                if len(self.poses) % 100 == 0:
+                    self.get_logger().info(f'Collected {len(self.poses)} poses')
+
+        pose_collector = PoseCollector()
+
+        # Prepare environment with ROS2 variables
+        env = os.environ.copy()
+        print(f"ROS_DOMAIN_ID: {env.get('ROS_DOMAIN_ID', 'not set')}")
+        print(f"RMW_IMPLEMENTATION: {env.get('RMW_IMPLEMENTATION', 'not set')}")
+
+        # Start SLAM node in subprocess (viewer MUST be disabled for subprocess compatibility)
+        slam_cmd = "ros2 run ros2_orb_slam3 rgbd_node_cpp --ros-args -p settings_name:=RealSense_D405 -p rgb_topic:=/camera/camera/color/image_rect_raw -p depth_topic:=/camera/camera/aligned_depth_to_color/image_raw -p enable_viewer:=false"
+        print(f"Starting SLAM node: {slam_cmd}")
+        slam_process = subprocess.Popen(
+            slam_cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            preexec_fn=os.setsid  # Create new process group for proper cleanup
+        )
+
+        # Wait for SLAM to initialize
+        print("Waiting for SLAM node to initialize (5 seconds)...")
+        time.sleep(5)
+
+        # Check if SLAM started
+        slam_poll = slam_process.poll()
+        if slam_poll is not None:
+            print(f"WARNING: SLAM process exited early with code: {slam_poll}")
+            _, stderr = slam_process.communicate()
+            if stderr:
+                print(f"SLAM stderr: {stderr.decode()[:500]}")
+
+        # Start bag play in subprocess
+        bag_cmd = f"ros2 bag play {bag_path} --rate 1.0"
+        print(f"Starting bag replay: {bag_cmd}")
+        bag_process = subprocess.Popen(
+            bag_cmd,
+            shell=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            preexec_fn=os.setsid  # Create new process group for proper cleanup
+        )
+
+        # Spin ROS node to collect poses while bag is playing
+        print("Collecting poses from SLAM...")
+
+        # Check if bag process started successfully
+        time.sleep(1)
+        bag_poll = bag_process.poll()
+        if bag_poll is not None:
+            print(f"WARNING: Bag process exited early with code: {bag_poll}")
+            stdout, stderr = bag_process.communicate()
+            if stderr:
+                print(f"Bag stderr: {stderr.decode()}")
+
+        try:
+            start_time = time.time()
+            while bag_process.poll() is None:
+                rclpy.spin_once(pose_collector, timeout_sec=0.1)
+                if len(pose_collector.poses) > 0 and len(pose_collector.poses) % 50 == 0:
+                    print(f"  Collected {len(pose_collector.poses)} poses so far...")
+
+            elapsed = time.time() - start_time
+            print(f"Bag finished after {elapsed:.1f}s")
+
+            # Continue spinning briefly to catch any remaining poses
+            print("Waiting for SLAM to finish processing...")
+            for _ in range(100):  # 10 more seconds
+                rclpy.spin_once(pose_collector, timeout_sec=0.1)
+
+        except KeyboardInterrupt:
+            print("Interrupted by user")
+        finally:
+            # Cleanup - kill entire process groups to ensure no orphan processes
+            print("Cleaning up SLAM processes...")
+
+            def kill_process_group(proc, name):
+                """Kill process and all its children using process group."""
+                if proc.poll() is None:  # Still running
+                    try:
+                        pgid = os.getpgid(proc.pid)
+                        os.killpg(pgid, signal.SIGTERM)
+                        try:
+                            proc.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            os.killpg(pgid, signal.SIGKILL)
+                            proc.wait(timeout=2)
+                        print(f"  {name} terminated")
+                    except ProcessLookupError:
+                        print(f"  {name} already terminated")
+                    except Exception as e:
+                        print(f"  Error terminating {name}: {e}")
+                else:
+                    print(f"  {name} already finished")
+
+            kill_process_group(slam_process, "SLAM node")
+            kill_process_group(bag_process, "Bag player")
+
+            pose_collector.destroy_node()
+            rclpy.shutdown()
+
+        collected_poses = pose_collector.poses
+        print(f"Collected {len(collected_poses)} poses from SLAM")
+
+        # Match poses to RGB frames
+        trajectory = self._match_poses_to_frames(collected_poses, rgb_data)
+
+        # Save trajectory to CSV
+        self._save_trajectory_csv(trajectory, output_dir)
+
+        return trajectory
+
+    def _generate_placeholder_trajectory(self, rgb_dir: str, rgb_data: List[Dict],
+                                          output_dir: str) -> List[Dict]:
+        """Generate placeholder identity poses."""
         rgb_files = sorted(Path(rgb_dir).glob('*.png'))
         trajectory = []
 
-        # Placeholder: identity poses (to be replaced with actual SLAM)
         for i, rgb_path in enumerate(rgb_files):
+            if rgb_data and i < len(rgb_data):
+                timestamp = rgb_data[i]['timestamp']
+            else:
+                timestamp = i / 30.0
+
             trajectory.append({
                 'frame_idx': i,
-                'timestamp': i / 30.0,  # Assuming 30 fps
+                'timestamp': timestamp,
                 'position': [0.0, 0.0, 0.0],
-                'quaternion': [0.0, 0.0, 0.0, 1.0],  # x, y, z, w
+                'quaternion': [0.0, 0.0, 0.0, 1.0],
                 'is_valid': True
             })
 
-        print(f"Generated {len(trajectory)} pose estimates")
-        print("Note: Replace with actual ORB-SLAM3 processing for real poses")
+        print(f"Generated {len(trajectory)} placeholder pose estimates")
+        self._save_trajectory_csv(trajectory, output_dir)
+        return trajectory
 
-        # Save trajectory to CSV
+    def _match_poses_to_frames(self, collected_poses: List[Dict],
+                                rgb_data: List[Dict]) -> List[Dict]:
+        """Match collected SLAM poses to RGB frame timestamps."""
+        if not collected_poses or not rgb_data:
+            return []
+
+        trajectory = []
+        pose_timestamps = np.array([p['timestamp'] for p in collected_poses])
+
+        for i, rgb in enumerate(rgb_data):
+            rgb_ts = rgb['timestamp']
+
+            # Find closest pose
+            diffs = np.abs(pose_timestamps - rgb_ts)
+            min_idx = np.argmin(diffs)
+            min_diff = diffs[min_idx]
+
+            # Accept if within 100ms
+            if min_diff < 0.1:
+                pose = collected_poses[min_idx]
+                trajectory.append({
+                    'frame_idx': i,
+                    'timestamp': rgb_ts,
+                    'position': pose['position'],
+                    'quaternion': pose['quaternion'],
+                    'is_valid': True
+                })
+            else:
+                # No matching pose found, use identity
+                trajectory.append({
+                    'frame_idx': i,
+                    'timestamp': rgb_ts,
+                    'position': [0.0, 0.0, 0.0],
+                    'quaternion': [0.0, 0.0, 0.0, 1.0],
+                    'is_valid': False
+                })
+
+        valid_count = sum(1 for t in trajectory if t['is_valid'])
+        print(f"Matched {valid_count}/{len(trajectory)} frames with valid poses")
+
+        return trajectory
+
+    def _save_trajectory_csv(self, trajectory: List[Dict], output_dir: str) -> None:
+        """Save trajectory to CSV file."""
         traj_path = os.path.join(output_dir, 'camera_trajectory.csv')
         with open(traj_path, 'w') as f:
             f.write('frame_idx,timestamp,x,y,z,qx,qy,qz,qw,is_valid\n')
@@ -262,8 +553,7 @@ class BagProcessor:
                        f"{pose['quaternion'][0]:.6f},{pose['quaternion'][1]:.6f},"
                        f"{pose['quaternion'][2]:.6f},{pose['quaternion'][3]:.6f},"
                        f"{1 if pose['is_valid'] else 0}\n")
-
-        return trajectory
+        print(f"Saved trajectory to {traj_path}")
 
     def synchronize_data(self, extracted_data: Dict, trajectory: List[Dict]) -> List[Dict]:
         """Synchronize RGB, Depth, Gripper, and Pose data by timestamp."""
@@ -272,7 +562,8 @@ class BagProcessor:
 
         rgb_data = extracted_data['rgb']
         depth_data = extracted_data['depth']
-        gripper_data = extracted_data['gripper']
+        gripper_obs_data = extracted_data['gripper_observation']  # From /joint_states
+        gripper_action_data = extracted_data['gripper_action']    # From /gripper_position_controller/commands
 
         if len(rgb_data) == 0:
             print("Error: No RGB data found")
@@ -289,9 +580,14 @@ class BagProcessor:
                 rgb_ts, [d['timestamp'] for d in depth_data]
             )
 
-            # Find closest gripper
-            gripper_idx = self._find_closest_timestamp(
-                rgb_ts, [g['timestamp'] for g in gripper_data]
+            # Find closest gripper observation (from /joint_states)
+            gripper_obs_idx = self._find_closest_timestamp(
+                rgb_ts, [g['timestamp'] for g in gripper_obs_data]
+            )
+
+            # Find closest gripper action (from /gripper_position_controller/commands)
+            gripper_action_idx = self._find_closest_timestamp(
+                rgb_ts, [g['timestamp'] for g in gripper_action_data]
             )
 
             # Find closest pose
@@ -304,7 +600,8 @@ class BagProcessor:
                 'timestamp': rgb_ts,
                 'rgb_path': rgb['path'],
                 'depth_path': depth_data[depth_idx]['path'] if depth_idx is not None else None,
-                'gripper_width': gripper_data[gripper_idx]['width'] if gripper_idx is not None else 0.0,
+                'gripper_observation': gripper_obs_data[gripper_obs_idx]['width'] if gripper_obs_idx is not None else 0.0,
+                'gripper_action': gripper_action_data[gripper_action_idx]['width'] if gripper_action_idx is not None else 0.0,
                 'pose': trajectory[pose_idx] if pose_idx is not None else None
             }
             synced_frames.append(synced_frame)
@@ -342,7 +639,8 @@ class BagProcessor:
             # Prepare arrays
             n_frames = len(synced_frames)
             timestamps = np.array([frame['timestamp'] for frame in synced_frames])
-            gripper_widths = np.array([frame['gripper_width'] for frame in synced_frames])
+            gripper_observations = np.array([frame['gripper_observation'] for frame in synced_frames])
+            gripper_actions = np.array([frame['gripper_action'] for frame in synced_frames])
 
             # Poses
             poses = np.zeros((n_frames, 7), dtype=np.float32)
@@ -386,7 +684,8 @@ class BagProcessor:
             # Store other data
             episode.create_dataset('timestamps', data=timestamps)
             episode.create_dataset('camera_pose', data=poses)
-            episode.create_dataset('gripper_width', data=gripper_widths)
+            episode.create_dataset('gripper_width', data=gripper_observations)  # Observation from /joint_states
+            episode.create_dataset('gripper_action', data=gripper_actions)       # Action from /commands
 
             # Metadata
             meta = f.create_group('metadata')
@@ -417,7 +716,11 @@ class BagProcessor:
         print("\n=== Step 2: Running offline SLAM ===")
         rgb_dir = os.path.join(output_dir, 'rgb')
         depth_dir = os.path.join(output_dir, 'depth')
-        trajectory = self.run_slam_offline(rgb_dir, depth_dir, output_dir)
+        trajectory = self.run_slam_offline(
+            rgb_dir, depth_dir, output_dir,
+            rgb_data=extracted_data.get('rgb', []),
+            bag_path=input_bag
+        )
 
         # Step 3: Synchronize data
         print("\n=== Step 3: Synchronizing data ===")

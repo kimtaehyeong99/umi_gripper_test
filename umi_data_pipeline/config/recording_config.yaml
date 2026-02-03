@@ -11,8 +11,13 @@ camera:
 
 # Gripper settings
 gripper:
-  topic: "/trigger_position_controller/commands"
-  topic_type: "std_msgs/msg/Float64MultiArray"
+  # Action topic: commanded gripper position
+  action_topic: "/gripper_position_controller/commands"
+  action_topic_type: "std_msgs/msg/Float64MultiArray"
+  # Observation topic: actual gripper state from joint_states
+  observation_topic: "/joint_states"
+  observation_topic_type: "sensor_msgs/msg/JointState"
+  joint_name: "gripper"   # Joint name in JointState message
   # Calibration: motor position to gripper width (meters)
   min_position: 0.0       # Fully closed motor position
   max_position: 1.0       # Fully open motor position
