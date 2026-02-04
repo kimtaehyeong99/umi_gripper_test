@@ -2,11 +2,13 @@
 data/raw/*
 data/processed/*
 data/datasets/*
+data/zarr/*
 
 # Keep directory structure
 !data/raw/.gitkeep
 !data/processed/.gitkeep
 !data/datasets/.gitkeep
+!data/zarr/.gitkeep
 
 # Python
 __pycache__/

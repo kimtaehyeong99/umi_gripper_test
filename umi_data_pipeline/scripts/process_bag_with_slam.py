@@ -31,6 +31,12 @@ import h5py
 import yaml
 import time
 
+# Rotation utilities for UMI format
+from rotation_utils import quaternion_to_axis_angle
+
+# UMI standard image size
+UMI_IMAGE_SIZE = (224, 224)
+
 # ROS2 bag reading
 try:
     from rosbags.rosbag2 import Reader
@@ -856,14 +862,22 @@ class OptimizedBagProcessor:
         print(f"Generated {len(poses)} placeholder poses")
         return poses
 
-    # ==================== HDF5 Writing ====================
+    # ==================== HDF5 Writing (UMI Format) ====================
 
     def save_to_hdf5_optimized(self, sync_data: Dict, output_path: str) -> None:
         """
-        Save synchronized data to HDF5.
-        Direct memory-to-HDF5, no intermediate disk reads.
+        Save synchronized data to HDF5 in UMI-compatible format.
+
+        UMI format requires:
+        - camera0_rgb: [T, 224, 224, 3] uint8
+        - robot0_eef_pos: [T, 3] float32 (position in meters)
+        - robot0_eef_rot_axis_angle: [T, 3] float32 (axis-angle rotation)
+        - robot0_gripper_width: [T, 1] float32 (gripper width in meters)
+        - robot0_demo_start_pose: [T, 6] float32 (episode start pose)
+        - robot0_demo_end_pose: [T, 6] float32 (episode end pose)
+        - action: [T, 7] float32 ([pos3, rot3, gripper1])
         """
-        print(f"Saving to HDF5: {output_path}")
+        print(f"Saving to HDF5 (UMI format): {output_path}")
         start_time = time.time()
 
         n_frames = sync_data['n_frames']
@@ -871,65 +885,106 @@ class OptimizedBagProcessor:
             print("Error: No frames to save")
             return
 
+        # Extract poses and convert quaternion to axis-angle
+        poses_quat = sync_data['poses']  # [T, 7] = [x,y,z,qx,qy,qz,qw]
+        positions = poses_quat[:, :3].astype(np.float32)  # [T, 3]
+
+        # Convert quaternions to axis-angle
+        quaternions = poses_quat[:, 3:7]  # [T, 4] = [qx,qy,qz,qw]
+        axis_angles = np.zeros((n_frames, 3), dtype=np.float32)
+        for i in range(n_frames):
+            axis_angles[i] = quaternion_to_axis_angle(quaternions[i])
+
+        # Gripper width - ensure shape [T, 1]
+        gripper_widths = sync_data['gripper_obs'].reshape(-1, 1).astype(np.float32)
+
+        # Create demo_start_pose and demo_end_pose [T, 6] = [pos3, rot3]
+        start_pose = np.concatenate([positions[0], axis_angles[0]])  # [6]
+        end_pose = np.concatenate([positions[-1], axis_angles[-1]])  # [6]
+        demo_start_pose = np.tile(start_pose, (n_frames, 1)).astype(np.float64)  # [T, 6]
+        demo_end_pose = np.tile(end_pose, (n_frames, 1)).astype(np.float64)  # [T, 6]
+
+        # Create action array [T, 7] = [pos3, rot3, gripper1]
+        # Action at time t = state at time t+1 (next frame target)
+        action = np.zeros((n_frames, 7), dtype=np.float32)
+        action[:-1, :3] = positions[1:]  # next position
+        action[:-1, 3:6] = axis_angles[1:]  # next rotation
+        action[:-1, 6:7] = gripper_widths[1:]  # next gripper
+        action[-1] = action[-2]  # last frame copies previous
+
         with h5py.File(output_path, 'w') as f:
-            episode = f.create_group('episode_0000')
+            # Create data group (UMI standard)
+            data = f.create_group('data')
 
-            # Get image dimensions
-            h, w = self.data_store.rgb_images[0].shape[:2]
-
-            # Create datasets
-            rgb_dataset = episode.create_dataset(
-                'rgb_images',
-                shape=(n_frames, h, w, 3),
+            # RGB images - resize to 224x224
+            print("Writing images to HDF5 (resizing to 224x224)...")
+            rgb_dataset = data.create_dataset(
+                'camera0_rgb',
+                shape=(n_frames, UMI_IMAGE_SIZE[0], UMI_IMAGE_SIZE[1], 3),
                 dtype=np.uint8,
-                compression='gzip',
-                compression_opts=4
+                compression='lzf'
             )
 
-            depth_dataset = episode.create_dataset(
-                'depth_images',
-                shape=(n_frames, h, w),
-                dtype=np.uint16,
-                compression='gzip',
-                compression_opts=4
-            )
-
-            # Write images directly from memory (no disk read!)
-            print("Writing images to HDF5...")
             depth_indices = sync_data['depth_indices']
-
             for i in range(n_frames):
-                # RGB - already in memory
-                rgb_dataset[i] = self.data_store.rgb_images[i]
-
-                # Depth - use synced index
-                if depth_indices[i] >= 0:
-                    depth_dataset[i] = self.data_store.depth_images[depth_indices[i]]
+                # Resize RGB to 224x224
+                rgb_resized = cv2.resize(
+                    self.data_store.rgb_images[i],
+                    UMI_IMAGE_SIZE,
+                    interpolation=cv2.INTER_AREA
+                )
+                rgb_dataset[i] = rgb_resized
 
                 if (i + 1) % 200 == 0:
                     print(f"  Written {i + 1}/{n_frames} frames")
 
-            # Store scalar data
-            episode.create_dataset('timestamps', data=sync_data['timestamps'])
-            episode.create_dataset('camera_pose', data=sync_data['poses'])
-            episode.create_dataset('gripper_width', data=sync_data['gripper_obs'])
-            episode.create_dataset('gripper_action', data=sync_data['gripper_action'])
+            # Store pose data in UMI format
+            data.create_dataset('robot0_eef_pos', data=positions)
+            data.create_dataset('robot0_eef_rot_axis_angle', data=axis_angles)
+            data.create_dataset('robot0_gripper_width', data=gripper_widths)
+            data.create_dataset('robot0_demo_start_pose', data=demo_start_pose)
+            data.create_dataset('robot0_demo_end_pose', data=demo_end_pose)
+            data.create_dataset('action', data=action)
+            data.create_dataset('timestamps', data=sync_data['timestamps'])
 
-            # Metadata
-            meta = f.create_group('metadata')
+            # Depth images (optional, for debugging)
+            h, w = self.data_store.depth_images[0].shape[:2]
+            depth_dataset = data.create_dataset(
+                'depth_images',
+                shape=(n_frames, h, w),
+                dtype=np.uint16,
+                compression='lzf'
+            )
+            for i in range(n_frames):
+                if depth_indices[i] >= 0:
+                    depth_dataset[i] = self.data_store.depth_images[depth_indices[i]]
+
+            # Create meta group
+            meta = f.create_group('meta')
+            # Episode ends - cumulative indices where episodes end
+            episode_ends = np.array([n_frames], dtype=np.int64)
+            meta.create_dataset('episode_ends', data=episode_ends)
+
+            # Additional metadata
             meta.attrs['num_episodes'] = 1
             meta.attrs['fps'] = self.config['camera']['fps']
             meta.attrs['num_frames'] = n_frames
+            meta.attrs['image_size'] = UMI_IMAGE_SIZE
 
             if self.data_store.camera_info:
-                meta.attrs['image_width'] = self.data_store.camera_info['width']
-                meta.attrs['image_height'] = self.data_store.camera_info['height']
+                meta.attrs['original_image_width'] = self.data_store.camera_info['width']
+                meta.attrs['original_image_height'] = self.data_store.camera_info['height']
                 meta.create_dataset('camera_K', data=np.array(self.data_store.camera_info['K']))
                 if self.data_store.camera_info['D']:
                     meta.create_dataset('camera_D', data=np.array(self.data_store.camera_info['D']))
 
         elapsed = time.time() - start_time
-        print(f"Saved {n_frames} frames to HDF5 in {elapsed:.1f}s")
+        print(f"Saved {n_frames} frames to HDF5 (UMI format) in {elapsed:.1f}s")
+        print(f"  camera0_rgb: [{n_frames}, {UMI_IMAGE_SIZE[0]}, {UMI_IMAGE_SIZE[1]}, 3]")
+        print(f"  robot0_eef_pos: [{n_frames}, 3]")
+        print(f"  robot0_eef_rot_axis_angle: [{n_frames}, 3]")
+        print(f"  robot0_gripper_width: [{n_frames}, 1]")
+        print(f"  action: [{n_frames}, 7]")
 
     def _run_direct_slam(self) -> List[Dict]:
         """Run Direct SLAM using pybind11 bindings."""
