@@ -1,15 +1,19 @@
 #!/usr/bin/env python3
 """
-UMI Data Pipeline - Process Bag with SLAM
+UMI Data Pipeline - Optimized Bag Processor with Direct SLAM
 
-This script processes a ROS2 bag file:
-1. Extracts RGB/Depth images and gripper data
-2. Runs ORB-SLAM3 offline to get camera trajectory
-3. Synchronizes all data
-4. Saves to HDF5 format
+Optimized version (v2.0) with:
+- Direct ORB-SLAM3 API calls via pybind11 (no ros2 bag play overhead)
+- In-memory processing (no intermediate disk I/O)
+- Vectorized timestamp matching (O(N log M) instead of O(N*M))
+- Compressed image decoding support
 
 Usage:
+    # Direct SLAM mode (default, recommended)
     python3 process_bag_with_slam.py --input data/raw/session_001 --output data/processed/session_001
+
+    # With ROS2 SLAM visualization (slower)
+    python3 process_bag_with_slam.py --input data/raw/session_001 --output data/processed/session_001 --use-ros2-slam
 """
 
 import argparse
@@ -18,14 +22,14 @@ import sys
 import json
 import subprocess
 import signal
-import tempfile
-import shutil
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Any
+from dataclasses import dataclass, field
 import numpy as np
 import cv2
 import h5py
 import yaml
+import time
 
 # ROS2 bag reading
 try:
@@ -44,19 +48,258 @@ try:
     from rclpy.node import Node
     from geometry_msgs.msg import PoseStamped
     import threading
-    import time
-    import signal
     RCLPY_AVAILABLE = True
 except ImportError:
     RCLPY_AVAILABLE = False
-    print("Warning: rclpy not available. SLAM integration will use placeholder.")
+    print("Warning: rclpy not available. ROS2 SLAM mode will not work.")
+
+# Direct ORB-SLAM3 Python bindings
+DIRECT_SLAM_AVAILABLE = False
+orb_slam3_py = None
+try:
+    import sys
+    # Add the installed pybind11 module path
+    sys.path.insert(0, '/home/robotis-ai/umi_ws/install/ros2_orb_slam3/lib/ros2_orb_slam3')
+    import orb_slam3_py
+    DIRECT_SLAM_AVAILABLE = True
+    print("ORB-SLAM3 Python bindings loaded successfully")
+except ImportError as e:
+    print(f"Warning: ORB-SLAM3 Python bindings not available: {e}")
+    print("  Direct SLAM mode will not work. Use --use-ros2-slam or --no-slam")
 
 
-class BagProcessor:
-    """Process ROS2 bag files for UMI dataset creation."""
+@dataclass
+class InMemoryDataStore:
+    """Store extracted data in memory instead of disk for fast processing."""
 
-    def __init__(self, config_path: Optional[str] = None):
+    # Images stored in memory
+    rgb_images: List[np.ndarray] = field(default_factory=list)
+    depth_images: List[np.ndarray] = field(default_factory=list)
+
+    # Timestamps
+    rgb_timestamps: List[float] = field(default_factory=list)
+    depth_timestamps: List[float] = field(default_factory=list)
+
+    # Gripper data: (timestamp, width)
+    gripper_obs: List[Tuple[float, float]] = field(default_factory=list)
+    gripper_action: List[Tuple[float, float]] = field(default_factory=list)
+
+    # Camera info
+    camera_info: Optional[Dict] = None
+
+    def add_rgb(self, timestamp: float, image: np.ndarray):
+        """Add RGB image with timestamp."""
+        self.rgb_timestamps.append(timestamp)
+        self.rgb_images.append(image)
+
+    def add_depth(self, timestamp: float, depth: np.ndarray):
+        """Add depth image with timestamp."""
+        self.depth_timestamps.append(timestamp)
+        self.depth_images.append(depth)
+
+    def add_gripper_obs(self, timestamp: float, width: float):
+        """Add gripper observation (from /joint_states)."""
+        self.gripper_obs.append((timestamp, width))
+
+    def add_gripper_action(self, timestamp: float, width: float):
+        """Add gripper action (from /commands)."""
+        self.gripper_action.append((timestamp, width))
+
+    def to_numpy_arrays(self) -> Dict[str, np.ndarray]:
+        """Convert lists to numpy arrays for vectorized operations."""
+        return {
+            'rgb_timestamps': np.array(self.rgb_timestamps, dtype=np.float64),
+            'depth_timestamps': np.array(self.depth_timestamps, dtype=np.float64),
+            'gripper_obs_timestamps': np.array([g[0] for g in self.gripper_obs], dtype=np.float64),
+            'gripper_obs_widths': np.array([g[1] for g in self.gripper_obs], dtype=np.float32),
+            'gripper_action_timestamps': np.array([g[0] for g in self.gripper_action], dtype=np.float64),
+            'gripper_action_widths': np.array([g[1] for g in self.gripper_action], dtype=np.float32),
+        }
+
+    @property
+    def num_rgb_frames(self) -> int:
+        return len(self.rgb_images)
+
+    @property
+    def num_depth_frames(self) -> int:
+        return len(self.depth_images)
+
+    def get_memory_usage_mb(self) -> float:
+        """Estimate memory usage in MB."""
+        total = 0
+        for img in self.rgb_images:
+            total += img.nbytes
+        for img in self.depth_images:
+            total += img.nbytes
+        return total / (1024 * 1024)
+
+
+class DirectSLAMProcessor:
+    """
+    Direct SLAM processing using pybind11 bindings.
+    No ROS2 bag play, no topic overhead - just direct API calls.
+    """
+
+    def __init__(self, vocab_path: str, settings_path: str):
+        """
+        Initialize ORB-SLAM3 directly.
+
+        Args:
+            vocab_path: Path to ORB vocabulary file (.txt.bin)
+            settings_path: Path to camera settings YAML file
+        """
+        if not DIRECT_SLAM_AVAILABLE:
+            raise RuntimeError("ORB-SLAM3 Python bindings not available")
+
+        print(f"\nInitializing Direct SLAM Processor...")
+        print(f"  Vocabulary: {vocab_path}")
+        print(f"  Settings: {settings_path}")
+
+        # Set library path for runtime linking
+        import os
+        lib_path = '/home/robotis-ai/umi_ws/install/ros2_orb_slam3/lib'
+        current_ld_path = os.environ.get('LD_LIBRARY_PATH', '')
+        if lib_path not in current_ld_path:
+            os.environ['LD_LIBRARY_PATH'] = f"{lib_path}:{current_ld_path}"
+
+        self.slam = orb_slam3_py.ORBSLAM3(
+            vocab_path,
+            settings_path,
+            False  # No viewer for batch processing
+        )
+        self.poses = []
+
+    def process_frames(self, data_store: InMemoryDataStore,
+                       max_depth_diff: float = 0.05) -> List[Dict]:
+        """
+        Process all RGB-D frames and return poses.
+
+        Args:
+            data_store: InMemoryDataStore with RGB and depth images
+            max_depth_diff: Maximum timestamp difference for RGB-Depth matching
+
+        Returns:
+            List of pose dictionaries
+        """
+        print(f"\nProcessing {data_store.num_rgb_frames} frames with Direct SLAM...")
+        start_time = time.time()
+
+        # Vectorized RGB-Depth timestamp matching
+        rgb_ts = np.array(data_store.rgb_timestamps, dtype=np.float64)
+        depth_ts = np.array(data_store.depth_timestamps, dtype=np.float64)
+
+        # Find nearest depth for each RGB frame
+        if len(depth_ts) > 0:
+            sorted_indices = np.argsort(depth_ts)
+            sorted_ts = depth_ts[sorted_indices]
+            indices = np.searchsorted(sorted_ts, rgb_ts)
+            indices = np.clip(indices, 0, len(sorted_ts) - 1)
+
+            # Check neighbors
+            indices_left = np.clip(indices - 1, 0, len(sorted_ts) - 1)
+            diff_right = np.abs(sorted_ts[indices] - rgb_ts)
+            diff_left = np.abs(sorted_ts[indices_left] - rgb_ts)
+            use_left = diff_left < diff_right
+            depth_sorted_indices = np.where(use_left, indices_left, indices)
+            depth_indices = sorted_indices[depth_sorted_indices]
+
+            # Mark invalid matches
+            min_diff = np.minimum(diff_left, diff_right)
+            depth_indices = np.where(min_diff <= max_depth_diff, depth_indices, -1)
+        else:
+            depth_indices = np.full(len(rgb_ts), -1, dtype=np.int64)
+
+        # Process each frame
+        self.poses = []
+        valid_count = 0
+        skipped_count = 0
+
+        for i in range(data_store.num_rgb_frames):
+            rgb = data_store.rgb_images[i]
+            timestamp = data_store.rgb_timestamps[i]
+
+            # Get matched depth
+            depth_idx = depth_indices[i]
+            if depth_idx < 0:
+                skipped_count += 1
+                continue
+
+            depth = data_store.depth_images[depth_idx]
+
+            # Convert depth to float32 (keep mm units)
+            # ORB-SLAM3 applies DepthMapFactor internally (1000.0 for mm->m)
+            if depth.dtype == np.uint16:
+                depth_float = depth.astype(np.float32)
+            else:
+                depth_float = depth.astype(np.float32)
+
+            # Track with SLAM
+            result = self.slam.track_rgbd(rgb, depth_float, timestamp)
+
+            if result is not None:
+                position, quaternion = result
+                pose = {
+                    'timestamp': timestamp,
+                    'position': list(position),
+                    'quaternion': list(quaternion),
+                    'is_valid': True
+                }
+                valid_count += 1
+            else:
+                # Tracking failed - store placeholder
+                pose = {
+                    'timestamp': timestamp,
+                    'position': [0.0, 0.0, 0.0],
+                    'quaternion': [0.0, 0.0, 0.0, 1.0],
+                    'is_valid': False
+                }
+
+            self.poses.append(pose)
+
+            # Progress update
+            if (i + 1) % 100 == 0:
+                print(f"  Processed {i + 1}/{data_store.num_rgb_frames} frames, "
+                      f"valid: {valid_count}, tracking state: {self.slam.get_tracking_state()}")
+
+        elapsed = time.time() - start_time
+        print(f"\nDirect SLAM complete in {elapsed:.1f}s")
+        print(f"  Total frames: {data_store.num_rgb_frames}")
+        print(f"  Skipped (no depth): {skipped_count}")
+        print(f"  Valid poses: {valid_count}")
+        print(f"  Processing rate: {data_store.num_rgb_frames / elapsed:.1f} fps")
+
+        return self.poses
+
+    def shutdown(self):
+        """Shutdown SLAM system."""
+        if hasattr(self, 'slam') and self.slam is not None:
+            self.slam.shutdown()
+            self.slam = None
+
+
+class OptimizedBagProcessor:
+    """Optimized ROS2 bag processor for UMI dataset creation."""
+
+    def __init__(self, config_path: Optional[str] = None,
+                 use_ros2_slam: bool = False):
+        """
+        Initialize processor.
+
+        Args:
+            config_path: Path to configuration YAML
+            use_ros2_slam: If True, use ros2 bag play + SLAM node (slower but with visualization)
+        """
         self.config = self._load_config(config_path)
+        self.use_ros2_slam = use_ros2_slam
+        self.data_store = InMemoryDataStore()
+
+        # Default paths for ORB-SLAM3
+        self.vocab_path = os.path.expanduser(
+            "~/umi_ws/src/umi_gripper_test/ros2_orb_slam3/orb_slam3/Vocabulary/ORBvoc.txt.bin"
+        )
+        self.settings_path = os.path.expanduser(
+            "~/umi_ws/src/umi_gripper_test/ros2_orb_slam3/orb_slam3/config/RGBD/RealSense_D405.yaml"
+        )
 
     def _load_config(self, config_path: Optional[str]) -> dict:
         """Load configuration from yaml file."""
@@ -68,9 +311,9 @@ class BagProcessor:
                 'fps': 30,
             },
             'gripper': {
-                'action_topic': '/gripper_position_controller/commands',  # Action (command)
-                'observation_topic': '/joint_states',  # Observation (actual state)
-                'joint_name': 'gripper',  # Joint name in JointState message
+                'action_topic': '/gripper_position_controller/commands',
+                'observation_topic': '/joint_states',
+                'joint_name': 'gripper',
                 'min_position': 0.0,
                 'max_position': 1.0,
                 'min_width': 0.0,
@@ -84,7 +327,6 @@ class BagProcessor:
         if config_path and os.path.exists(config_path):
             with open(config_path, 'r') as f:
                 user_config = yaml.safe_load(f)
-                # Merge configs
                 for key in user_config:
                     if key in default_config:
                         default_config[key].update(user_config[key])
@@ -93,111 +335,42 @@ class BagProcessor:
 
         return default_config
 
-    def extract_data_from_bag(self, bag_path: str, output_dir: str) -> Dict:
-        """Extract RGB, Depth, and Gripper data from ROS2 bag."""
+    # ==================== Compressed Image Decoders ====================
 
-        if not ROSBAGS_AVAILABLE:
-            raise ImportError("rosbags package is required. Install with: pip install rosbags")
+    def _decode_compressed_image(self, msg) -> Optional[np.ndarray]:
+        """Decode ROS CompressedImage message to numpy array (BGR format for ORB-SLAM3)."""
+        try:
+            np_arr = np.frombuffer(msg.data, np.uint8)
+            img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)  # BGR format, same as C++ SLAM node
+            return img
+        except Exception as e:
+            print(f"Error decoding compressed image: {e}")
+            return None
 
-        print(f"Extracting data from: {bag_path}")
+    def _decode_compressed_depth(self, msg) -> Optional[np.ndarray]:
+        """Decode ROS CompressedDepth message to numpy array."""
+        try:
+            # CompressedDepth format: first 12 bytes are header
+            # (compression config: 4 bytes type, 4 bytes quantization, 4 bytes reserved)
+            depth_header_size = 12
+            raw_data = msg.data[depth_header_size:]
 
-        # Create output directories
-        rgb_dir = os.path.join(output_dir, 'rgb')
-        depth_dir = os.path.join(output_dir, 'depth')
-        os.makedirs(rgb_dir, exist_ok=True)
-        os.makedirs(depth_dir, exist_ok=True)
+            # Decompress PNG
+            np_arr = np.frombuffer(raw_data, np.uint8)
+            depth = cv2.imdecode(np_arr, cv2.IMREAD_UNCHANGED)
 
-        rgb_topic = self.config['camera']['rgb_topic']
-        depth_topic = self.config['camera']['depth_topic']
-        gripper_action_topic = self.config['gripper']['action_topic']
-        gripper_obs_topic = self.config['gripper']['observation_topic']
+            if depth is None:
+                # Try without header (some implementations skip header)
+                np_arr = np.frombuffer(msg.data, np.uint8)
+                depth = cv2.imdecode(np_arr, cv2.IMREAD_UNCHANGED)
 
-        rgb_data = []
-        depth_data = []
-        gripper_action_data = []  # From commands (action)
-        gripper_obs_data = []     # From joint_states (observation)
-        camera_info = None
+            return depth
+        except Exception as e:
+            print(f"Error decoding compressed depth: {e}")
+            return None
 
-        with Reader(bag_path) as reader:
-            # Get connections for our topics
-            connections = {}
-            for conn in reader.connections:
-                if conn.topic in [rgb_topic, depth_topic, gripper_action_topic,
-                                  gripper_obs_topic, self.config['camera']['camera_info_topic']]:
-                    connections[conn.topic] = conn
-
-            print(f"Found topics: {list(connections.keys())}")
-
-            # Read messages
-            for conn, timestamp, rawdata in reader.messages():
-                topic = conn.topic
-                ts_sec = timestamp / 1e9  # Convert to seconds
-
-                if topic == rgb_topic:
-                    msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
-                    img = self._decode_image(msg, 'rgb8')
-                    if img is not None:
-                        frame_idx = len(rgb_data)
-                        img_path = os.path.join(rgb_dir, f'{frame_idx:06d}.png')
-                        cv2.imwrite(img_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-                        rgb_data.append({
-                            'timestamp': ts_sec,
-                            'path': img_path,
-                            'frame_idx': frame_idx
-                        })
-
-                elif topic == depth_topic:
-                    msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
-                    depth = self._decode_depth(msg)
-                    if depth is not None:
-                        frame_idx = len(depth_data)
-                        depth_path = os.path.join(depth_dir, f'{frame_idx:06d}.png')
-                        cv2.imwrite(depth_path, depth)
-                        depth_data.append({
-                            'timestamp': ts_sec,
-                            'path': depth_path,
-                            'frame_idx': frame_idx
-                        })
-
-                elif topic == gripper_action_topic:
-                    msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
-                    width = self._decode_gripper_command(msg)
-                    gripper_action_data.append({
-                        'timestamp': ts_sec,
-                        'width': width
-                    })
-
-                elif topic == gripper_obs_topic:
-                    msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
-                    width = self._decode_joint_states(msg)
-                    if width is not None:
-                        gripper_obs_data.append({
-                            'timestamp': ts_sec,
-                            'width': width
-                        })
-
-                elif topic == self.config['camera']['camera_info_topic'] and camera_info is None:
-                    msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
-                    camera_info = {
-                        'width': msg.width,
-                        'height': msg.height,
-                        'K': list(msg.k),
-                        'D': list(msg.d),
-                    }
-
-        print(f"Extracted: {len(rgb_data)} RGB, {len(depth_data)} Depth")
-        print(f"  Gripper: {len(gripper_obs_data)} observations, {len(gripper_action_data)} actions")
-
-        return {
-            'rgb': rgb_data,
-            'depth': depth_data,
-            'gripper_observation': gripper_obs_data,  # From /joint_states
-            'gripper_action': gripper_action_data,    # From /gripper_position_controller/commands
-            'camera_info': camera_info
-        }
-
-    def _decode_image(self, msg, encoding: str) -> Optional[np.ndarray]:
-        """Decode ROS Image message to numpy array."""
+    def _decode_raw_image(self, msg, encoding: str = 'rgb8') -> Optional[np.ndarray]:
+        """Decode ROS raw Image message to numpy array."""
         try:
             if msg.encoding == 'rgb8':
                 img = np.frombuffer(msg.data, dtype=np.uint8).reshape(msg.height, msg.width, 3)
@@ -209,35 +382,48 @@ class BagProcessor:
                 return None
             return img
         except Exception as e:
-            print(f"Error decoding image: {e}")
+            print(f"Error decoding raw image: {e}")
             return None
 
-    def _decode_depth(self, msg) -> Optional[np.ndarray]:
-        """Decode ROS Depth Image message to numpy array."""
+    def _decode_raw_depth(self, msg) -> Optional[np.ndarray]:
+        """Decode ROS raw Depth Image message to numpy array."""
         try:
             if msg.encoding == '16UC1':
                 depth = np.frombuffer(msg.data, dtype=np.uint16).reshape(msg.height, msg.width)
             elif msg.encoding == '32FC1':
                 depth = np.frombuffer(msg.data, dtype=np.float32).reshape(msg.height, msg.width)
-                depth = (depth * 1000).astype(np.uint16)  # Convert to mm
+                depth = (depth * 1000).astype(np.uint16)
             else:
                 print(f"Unknown depth encoding: {msg.encoding}")
                 return None
             return depth
         except Exception as e:
-            print(f"Error decoding depth: {e}")
+            print(f"Error decoding raw depth: {e}")
             return None
+
+    def _decode_image_auto(self, msg, topic: str) -> Optional[np.ndarray]:
+        """Auto-detect message type and decode image."""
+        # Check if compressed based on topic name or message type
+        if 'compressed' in topic.lower() or hasattr(msg, 'format'):
+            return self._decode_compressed_image(msg)
+        else:
+            return self._decode_raw_image(msg)
+
+    def _decode_depth_auto(self, msg, topic: str) -> Optional[np.ndarray]:
+        """Auto-detect message type and decode depth."""
+        if 'compressed' in topic.lower():
+            return self._decode_compressed_depth(msg)
+        else:
+            return self._decode_raw_depth(msg)
 
     def _decode_gripper_command(self, msg) -> float:
         """Decode gripper command message (Float64MultiArray) to width in meters."""
         try:
-            # Float64MultiArray - take first element
             if hasattr(msg, 'data') and len(msg.data) > 0:
                 position = msg.data[0]
             else:
                 position = 0.0
 
-            # Convert position to width using calibration
             cfg = self.config['gripper']
             pos_range = cfg['max_position'] - cfg['min_position']
             width_range = cfg['max_width'] - cfg['min_width']
@@ -258,13 +444,11 @@ class BagProcessor:
         try:
             joint_name = self.config['gripper'].get('joint_name', 'gripper')
 
-            # Find the gripper joint in JointState message
             if hasattr(msg, 'name') and hasattr(msg, 'position'):
                 for i, name in enumerate(msg.name):
                     if joint_name in name:
                         position = msg.position[i]
 
-                        # Convert position to width using calibration
                         cfg = self.config['gripper']
                         pos_range = cfg['max_position'] - cfg['min_position']
                         width_range = cfg['max_width'] - cfg['min_width']
@@ -282,52 +466,230 @@ class BagProcessor:
             print(f"Error decoding joint states: {e}")
             return None
 
-    def run_slam_offline(self, rgb_dir: str, depth_dir: str, output_dir: str,
-                          rgb_data: List[Dict] = None, bag_path: str = None) -> List[Dict]:
-        """
-        Run ORB-SLAM3 offline on extracted images.
+    # ==================== In-Memory Data Extraction ====================
 
-        This uses ros2 bag play + SLAM node approach.
+    def extract_data_to_memory(self, bag_path: str) -> InMemoryDataStore:
+        """
+        Extract all data from bag directly into memory.
+        No disk I/O for images - massive speedup.
+        """
+        if not ROSBAGS_AVAILABLE:
+            raise ImportError("rosbags package is required")
+
+        print(f"Extracting data to memory from: {bag_path}")
+        start_time = time.time()
+
+        self.data_store = InMemoryDataStore()
+
+        rgb_topic = self.config['camera']['rgb_topic']
+        depth_topic = self.config['camera']['depth_topic']
+        gripper_action_topic = self.config['gripper']['action_topic']
+        gripper_obs_topic = self.config['gripper']['observation_topic']
+        camera_info_topic = self.config['camera']['camera_info_topic']
+
+        with Reader(bag_path) as reader:
+            # Get available topics
+            available_topics = {conn.topic for conn in reader.connections}
+            print(f"Available topics in bag: {available_topics}")
+
+            # Check which topics exist
+            topics_to_read = []
+            for topic in [rgb_topic, depth_topic, gripper_action_topic, gripper_obs_topic, camera_info_topic]:
+                if topic in available_topics:
+                    topics_to_read.append(topic)
+                else:
+                    print(f"  Warning: Topic {topic} not found in bag")
+
+            print(f"Reading topics: {topics_to_read}")
+
+            frame_count = 0
+            for conn, timestamp, rawdata in reader.messages():
+                topic = conn.topic
+                ts_sec = timestamp / 1e9
+
+                if topic == rgb_topic:
+                    msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
+                    img = self._decode_image_auto(msg, topic)
+                    if img is not None:
+                        self.data_store.add_rgb(ts_sec, img)
+                        frame_count += 1
+                        if frame_count % 100 == 0:
+                            print(f"  Extracted {frame_count} RGB frames...")
+
+                elif topic == depth_topic:
+                    msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
+                    depth = self._decode_depth_auto(msg, topic)
+                    if depth is not None:
+                        self.data_store.add_depth(ts_sec, depth)
+
+                elif topic == gripper_action_topic:
+                    msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
+                    width = self._decode_gripper_command(msg)
+                    self.data_store.add_gripper_action(ts_sec, width)
+
+                elif topic == gripper_obs_topic:
+                    msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
+                    width = self._decode_joint_states(msg)
+                    if width is not None:
+                        self.data_store.add_gripper_obs(ts_sec, width)
+
+                elif topic == camera_info_topic and self.data_store.camera_info is None:
+                    msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
+                    self.data_store.camera_info = {
+                        'width': msg.width,
+                        'height': msg.height,
+                        'K': list(msg.k),
+                        'D': list(msg.d),
+                    }
+
+        elapsed = time.time() - start_time
+        mem_usage = self.data_store.get_memory_usage_mb()
+
+        print(f"\nExtraction complete in {elapsed:.1f}s")
+        print(f"  RGB frames: {self.data_store.num_rgb_frames}")
+        print(f"  Depth frames: {self.data_store.num_depth_frames}")
+        print(f"  Gripper observations: {len(self.data_store.gripper_obs)}")
+        print(f"  Gripper actions: {len(self.data_store.gripper_action)}")
+        print(f"  Memory usage: {mem_usage:.1f} MB")
+
+        return self.data_store
+
+    # ==================== Vectorized Timestamp Matching ====================
+
+    @staticmethod
+    def find_nearest_indices_vectorized(reference_ts: np.ndarray,
+                                         target_ts: np.ndarray,
+                                         max_diff: float = 0.1) -> np.ndarray:
+        """
+        Find nearest indices using vectorized numpy operations.
+        O(N log M) instead of O(N*M).
 
         Args:
-            rgb_dir: Directory containing RGB images
-            depth_dir: Directory containing depth images
-            output_dir: Output directory for trajectory file
-            rgb_data: Optional list of RGB frame data with timestamps
-            bag_path: Path to the ROS2 bag file for replay
+            reference_ts: Reference timestamps to match
+            target_ts: Target timestamps to search in
+            max_diff: Maximum allowed difference in seconds
+
+        Returns:
+            Array of indices (-1 for invalid matches)
         """
-        print("Running offline SLAM...")
+        if len(target_ts) == 0:
+            return np.full(len(reference_ts), -1, dtype=np.int64)
 
-        # Check if we can run real SLAM
-        if not RCLPY_AVAILABLE or bag_path is None:
-            print("SLAM not available, using placeholder poses...")
-            return self._generate_placeholder_trajectory(rgb_dir, rgb_data, output_dir)
+        # Ensure sorted for searchsorted
+        sorted_indices = np.argsort(target_ts)
+        sorted_ts = target_ts[sorted_indices]
 
-        try:
-            trajectory = self._run_slam_with_bag_replay(bag_path, rgb_data, output_dir)
-            if len(trajectory) == 0:
-                print("SLAM failed, falling back to placeholder poses...")
-                return self._generate_placeholder_trajectory(rgb_dir, rgb_data, output_dir)
-            return trajectory
-        except Exception as e:
-            print(f"SLAM error: {e}")
-            print("Falling back to placeholder poses...")
-            return self._generate_placeholder_trajectory(rgb_dir, rgb_data, output_dir)
+        # Find insertion points
+        indices = np.searchsorted(sorted_ts, reference_ts)
+        indices = np.clip(indices, 0, len(sorted_ts) - 1)
 
-    def _run_slam_with_bag_replay(self, bag_path: str, rgb_data: List[Dict],
-                                   output_dir: str) -> List[Dict]:
+        # Check both neighbors (left and right)
+        indices_left = np.clip(indices - 1, 0, len(sorted_ts) - 1)
+
+        # Compute differences
+        diff_right = np.abs(sorted_ts[indices] - reference_ts)
+        diff_left = np.abs(sorted_ts[indices_left] - reference_ts)
+
+        # Choose closer one
+        use_left = diff_left < diff_right
+        result_sorted = np.where(use_left, indices_left, indices)
+
+        # Map back to original indices
+        result = sorted_indices[result_sorted]
+
+        # Mask invalid matches (beyond max_diff)
+        min_diff = np.minimum(diff_left, diff_right)
+        result = np.where(min_diff <= max_diff, result, -1)
+
+        return result
+
+    def synchronize_data_vectorized(self, poses: List[Dict]) -> Dict[str, Any]:
+        """
+        Vectorized synchronization of all data streams.
+        Uses RGB timestamps as reference.
+        """
+        print("Synchronizing data (vectorized)...")
+        start_time = time.time()
+
+        arrays = self.data_store.to_numpy_arrays()
+        rgb_ts = arrays['rgb_timestamps']
+        n_frames = len(rgb_ts)
+
+        if n_frames == 0:
+            print("Error: No RGB frames found")
+            return {}
+
+        # Vectorized matching for all data streams
+        depth_indices = self.find_nearest_indices_vectorized(
+            rgb_ts, arrays['depth_timestamps']
+        )
+        gripper_obs_indices = self.find_nearest_indices_vectorized(
+            rgb_ts, arrays['gripper_obs_timestamps']
+        )
+        gripper_action_indices = self.find_nearest_indices_vectorized(
+            rgb_ts, arrays['gripper_action_timestamps']
+        )
+
+        # Pose matching
+        if poses:
+            pose_timestamps = np.array([p['timestamp'] for p in poses], dtype=np.float64)
+            pose_indices = self.find_nearest_indices_vectorized(rgb_ts, pose_timestamps)
+        else:
+            pose_indices = np.full(n_frames, -1, dtype=np.int64)
+
+        # Build synchronized data arrays
+        gripper_obs_synced = np.zeros(n_frames, dtype=np.float32)
+        gripper_action_synced = np.zeros(n_frames, dtype=np.float32)
+        poses_synced = np.zeros((n_frames, 7), dtype=np.float32)
+        poses_synced[:, 6] = 1.0  # Default quaternion w=1
+
+        # Fill gripper observations
+        valid_obs = gripper_obs_indices >= 0
+        gripper_obs_synced[valid_obs] = arrays['gripper_obs_widths'][gripper_obs_indices[valid_obs]]
+
+        # Fill gripper actions
+        valid_action = gripper_action_indices >= 0
+        gripper_action_synced[valid_action] = arrays['gripper_action_widths'][gripper_action_indices[valid_action]]
+
+        # Fill poses
+        valid_poses = pose_indices >= 0
+        for i in np.where(valid_poses)[0]:
+            pose = poses[pose_indices[i]]
+            poses_synced[i, :3] = pose['position']
+            poses_synced[i, 3:] = pose['quaternion']
+
+        elapsed = time.time() - start_time
+        print(f"Synchronization complete in {elapsed:.3f}s")
+        print(f"  Valid depth matches: {np.sum(depth_indices >= 0)}/{n_frames}")
+        print(f"  Valid gripper obs: {np.sum(valid_obs)}/{n_frames}")
+        print(f"  Valid gripper action: {np.sum(valid_action)}/{n_frames}")
+        print(f"  Valid poses: {np.sum(valid_poses)}/{n_frames}")
+
+        return {
+            'n_frames': n_frames,
+            'timestamps': rgb_ts,
+            'depth_indices': depth_indices,
+            'gripper_obs': gripper_obs_synced,
+            'gripper_action': gripper_action_synced,
+            'poses': poses_synced,
+            'valid_poses': valid_poses,
+        }
+
+    # ==================== SLAM Processing ====================
+
+    def run_slam_with_bag_replay(self, bag_path: str) -> List[Dict]:
         """
         Run SLAM by playing back the bag file and collecting poses.
+        Optimized version with smart initialization instead of hard sleep.
         """
+        if not RCLPY_AVAILABLE:
+            print("SLAM not available (rclpy not installed)")
+            return []
+
         print("Starting SLAM with bag replay...")
 
-        # Resolve absolute path for bag file
         bag_path = str(Path(bag_path).resolve())
-        print(f"Bag path (absolute): {bag_path}")
-
-        collected_poses = []
-        slam_ready = threading.Event()
-        bag_finished = threading.Event()
+        print(f"Bag path: {bag_path}")
 
         # Initialize rclpy
         rclpy.init()
@@ -365,84 +727,97 @@ class BagProcessor:
                     self.get_logger().info(f'Collected {len(self.poses)} poses')
 
         pose_collector = PoseCollector()
-
-        # Prepare environment with ROS2 variables
         env = os.environ.copy()
-        print(f"ROS_DOMAIN_ID: {env.get('ROS_DOMAIN_ID', 'not set')}")
-        print(f"RMW_IMPLEMENTATION: {env.get('RMW_IMPLEMENTATION', 'not set')}")
 
-        # Start SLAM node in subprocess (viewer MUST be disabled for subprocess compatibility)
-        slam_cmd = "ros2 run ros2_orb_slam3 rgbd_node_cpp --ros-args -p settings_name:=RealSense_D405 -p rgb_topic:=/camera/camera/color/image_rect_raw/compressed -p depth_topic:=/camera/camera/aligned_depth_to_color/image_raw/compressedDepth -p enable_viewer:=false"
-        print(f"Starting SLAM node: {slam_cmd}")
+        # Get RGB/Depth topics from config
+        rgb_topic = self.config['camera']['rgb_topic']
+        depth_topic = self.config['camera']['depth_topic']
+
+        # Start SLAM node (viewer disabled for subprocess compatibility)
+        slam_cmd = f"ros2 run ros2_orb_slam3 rgbd_node_cpp --ros-args -p settings_name:=RealSense_D405 -p rgb_topic:={rgb_topic} -p depth_topic:={depth_topic} -p enable_viewer:=false"
+        print(f"Starting SLAM: {slam_cmd}")
+
         slam_process = subprocess.Popen(
             slam_cmd,
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
-            preexec_fn=os.setsid  # Create new process group for proper cleanup
+            preexec_fn=os.setsid
         )
 
-        # Wait for SLAM to initialize
-        print("Waiting for SLAM node to initialize (5 seconds)...")
-        time.sleep(5)
+        # Smart SLAM initialization check instead of hard 5s sleep
+        print("Waiting for SLAM initialization...")
+        slam_ready = False
+        max_wait = 15  # Maximum 15 seconds
 
-        # Check if SLAM started
-        slam_poll = slam_process.poll()
-        if slam_poll is not None:
-            print(f"WARNING: SLAM process exited early with code: {slam_poll}")
-            _, stderr = slam_process.communicate()
-            if stderr:
-                print(f"SLAM stderr: {stderr.decode()[:500]}")
+        for i in range(max_wait * 2):  # Check every 0.5s
+            if slam_process.poll() is not None:
+                print(f"WARNING: SLAM process exited with code: {slam_process.poll()}")
+                break
 
-        # Start bag play in subprocess
+            # Check if SLAM node is publishing
+            try:
+                result = subprocess.run(
+                    ['ros2', 'topic', 'list'],
+                    capture_output=True, text=True, timeout=2
+                )
+                if '/orb_slam3/camera_pose' in result.stdout:
+                    slam_ready = True
+                    print(f"SLAM ready after {(i+1)*0.5:.1f}s")
+                    break
+            except:
+                pass
+
+            time.sleep(0.5)
+
+        if not slam_ready:
+            print("WARNING: SLAM may not be fully initialized, proceeding anyway...")
+
+        # Start bag replay
         bag_cmd = f"ros2 bag play {bag_path} --rate 1.0"
         print(f"Starting bag replay: {bag_cmd}")
+
         bag_process = subprocess.Popen(
             bag_cmd,
             shell=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             env=env,
-            preexec_fn=os.setsid  # Create new process group for proper cleanup
+            preexec_fn=os.setsid
         )
 
-        # Spin ROS node to collect poses while bag is playing
+        # Collect poses while bag is playing
         print("Collecting poses from SLAM...")
-
-        # Check if bag process started successfully
-        time.sleep(1)
-        bag_poll = bag_process.poll()
-        if bag_poll is not None:
-            print(f"WARNING: Bag process exited early with code: {bag_poll}")
-            stdout, stderr = bag_process.communicate()
-            if stderr:
-                print(f"Bag stderr: {stderr.decode()}")
 
         try:
             start_time = time.time()
+            last_pose_count = 0
+
             while bag_process.poll() is None:
                 rclpy.spin_once(pose_collector, timeout_sec=0.1)
-                if len(pose_collector.poses) > 0 and len(pose_collector.poses) % 50 == 0:
-                    print(f"  Collected {len(pose_collector.poses)} poses so far...")
+
+                # Progress update
+                if len(pose_collector.poses) > last_pose_count and len(pose_collector.poses) % 50 == 0:
+                    print(f"  Collected {len(pose_collector.poses)} poses...")
+                    last_pose_count = len(pose_collector.poses)
 
             elapsed = time.time() - start_time
             print(f"Bag finished after {elapsed:.1f}s")
 
-            # Continue spinning briefly to catch any remaining poses
-            print("Waiting for SLAM to finish processing...")
-            for _ in range(100):  # 10 more seconds
+            # Brief additional collection for remaining poses
+            print("Collecting remaining poses...")
+            for _ in range(50):  # 5 more seconds
                 rclpy.spin_once(pose_collector, timeout_sec=0.1)
 
         except KeyboardInterrupt:
             print("Interrupted by user")
         finally:
-            # Cleanup - kill entire process groups to ensure no orphan processes
+            # Cleanup using process groups
             print("Cleaning up SLAM processes...")
 
             def kill_process_group(proc, name):
-                """Kill process and all its children using process group."""
-                if proc.poll() is None:  # Still running
+                if proc.poll() is None:
                     try:
                         pgid = os.getpgid(proc.pid)
                         os.killpg(pgid, signal.SIGTERM)
@@ -465,227 +840,80 @@ class BagProcessor:
             pose_collector.destroy_node()
             rclpy.shutdown()
 
-        collected_poses = pose_collector.poses
-        print(f"Collected {len(collected_poses)} poses from SLAM")
+        print(f"Collected {len(pose_collector.poses)} poses from SLAM")
+        return pose_collector.poses
 
-        # Match poses to RGB frames
-        trajectory = self._match_poses_to_frames(collected_poses, rgb_data)
-
-        # Save trajectory to CSV
-        self._save_trajectory_csv(trajectory, output_dir)
-
-        return trajectory
-
-    def _generate_placeholder_trajectory(self, rgb_dir: str, rgb_data: List[Dict],
-                                          output_dir: str) -> List[Dict]:
-        """Generate placeholder identity poses."""
-        rgb_files = sorted(Path(rgb_dir).glob('*.png'))
-        trajectory = []
-
-        for i, rgb_path in enumerate(rgb_files):
-            if rgb_data and i < len(rgb_data):
-                timestamp = rgb_data[i]['timestamp']
-            else:
-                timestamp = i / 30.0
-
-            trajectory.append({
-                'frame_idx': i,
-                'timestamp': timestamp,
+    def generate_placeholder_poses(self) -> List[Dict]:
+        """Generate placeholder identity poses for all RGB frames."""
+        poses = []
+        for i, ts in enumerate(self.data_store.rgb_timestamps):
+            poses.append({
+                'timestamp': ts,
                 'position': [0.0, 0.0, 0.0],
                 'quaternion': [0.0, 0.0, 0.0, 1.0],
-                'is_valid': True
+                'is_valid': False
             })
+        print(f"Generated {len(poses)} placeholder poses")
+        return poses
 
-        print(f"Generated {len(trajectory)} placeholder pose estimates")
-        self._save_trajectory_csv(trajectory, output_dir)
-        return trajectory
+    # ==================== HDF5 Writing ====================
 
-    def _match_poses_to_frames(self, collected_poses: List[Dict],
-                                rgb_data: List[Dict]) -> List[Dict]:
-        """Match collected SLAM poses to RGB frame timestamps."""
-        if not collected_poses or not rgb_data:
-            return []
-
-        trajectory = []
-        pose_timestamps = np.array([p['timestamp'] for p in collected_poses])
-
-        for i, rgb in enumerate(rgb_data):
-            rgb_ts = rgb['timestamp']
-
-            # Find closest pose
-            diffs = np.abs(pose_timestamps - rgb_ts)
-            min_idx = np.argmin(diffs)
-            min_diff = diffs[min_idx]
-
-            # Accept if within 100ms
-            if min_diff < 0.1:
-                pose = collected_poses[min_idx]
-                trajectory.append({
-                    'frame_idx': i,
-                    'timestamp': rgb_ts,
-                    'position': pose['position'],
-                    'quaternion': pose['quaternion'],
-                    'is_valid': True
-                })
-            else:
-                # No matching pose found, use identity
-                trajectory.append({
-                    'frame_idx': i,
-                    'timestamp': rgb_ts,
-                    'position': [0.0, 0.0, 0.0],
-                    'quaternion': [0.0, 0.0, 0.0, 1.0],
-                    'is_valid': False
-                })
-
-        valid_count = sum(1 for t in trajectory if t['is_valid'])
-        print(f"Matched {valid_count}/{len(trajectory)} frames with valid poses")
-
-        return trajectory
-
-    def _save_trajectory_csv(self, trajectory: List[Dict], output_dir: str) -> None:
-        """Save trajectory to CSV file."""
-        traj_path = os.path.join(output_dir, 'camera_trajectory.csv')
-        with open(traj_path, 'w') as f:
-            f.write('frame_idx,timestamp,x,y,z,qx,qy,qz,qw,is_valid\n')
-            for pose in trajectory:
-                f.write(f"{pose['frame_idx']},{pose['timestamp']:.6f},"
-                       f"{pose['position'][0]:.6f},{pose['position'][1]:.6f},{pose['position'][2]:.6f},"
-                       f"{pose['quaternion'][0]:.6f},{pose['quaternion'][1]:.6f},"
-                       f"{pose['quaternion'][2]:.6f},{pose['quaternion'][3]:.6f},"
-                       f"{1 if pose['is_valid'] else 0}\n")
-        print(f"Saved trajectory to {traj_path}")
-
-    def synchronize_data(self, extracted_data: Dict, trajectory: List[Dict]) -> List[Dict]:
-        """Synchronize RGB, Depth, Gripper, and Pose data by timestamp."""
-
-        print("Synchronizing data...")
-
-        rgb_data = extracted_data['rgb']
-        depth_data = extracted_data['depth']
-        gripper_obs_data = extracted_data['gripper_observation']  # From /joint_states
-        gripper_action_data = extracted_data['gripper_action']    # From /gripper_position_controller/commands
-
-        if len(rgb_data) == 0:
-            print("Error: No RGB data found")
-            return []
-
-        # Use RGB timestamps as reference
-        synced_frames = []
-
-        for i, rgb in enumerate(rgb_data):
-            rgb_ts = rgb['timestamp']
-
-            # Find closest depth
-            depth_idx = self._find_closest_timestamp(
-                rgb_ts, [d['timestamp'] for d in depth_data]
-            )
-
-            # Find closest gripper observation (from /joint_states)
-            gripper_obs_idx = self._find_closest_timestamp(
-                rgb_ts, [g['timestamp'] for g in gripper_obs_data]
-            )
-
-            # Find closest gripper action (from /gripper_position_controller/commands)
-            gripper_action_idx = self._find_closest_timestamp(
-                rgb_ts, [g['timestamp'] for g in gripper_action_data]
-            )
-
-            # Find closest pose
-            pose_idx = self._find_closest_timestamp(
-                rgb_ts, [p['timestamp'] for p in trajectory]
-            )
-
-            synced_frame = {
-                'frame_idx': i,
-                'timestamp': rgb_ts,
-                'rgb_path': rgb['path'],
-                'depth_path': depth_data[depth_idx]['path'] if depth_idx is not None else None,
-                'gripper_observation': gripper_obs_data[gripper_obs_idx]['width'] if gripper_obs_idx is not None else 0.0,
-                'gripper_action': gripper_action_data[gripper_action_idx]['width'] if gripper_action_idx is not None else 0.0,
-                'pose': trajectory[pose_idx] if pose_idx is not None else None
-            }
-            synced_frames.append(synced_frame)
-
-        print(f"Synchronized {len(synced_frames)} frames")
-        return synced_frames
-
-    def _find_closest_timestamp(self, target_ts: float, timestamps: List[float],
-                                max_diff: float = 0.1) -> Optional[int]:
-        """Find index of closest timestamp within max_diff seconds."""
-        if len(timestamps) == 0:
-            return None
-
-        diffs = [abs(ts - target_ts) for ts in timestamps]
-        min_idx = np.argmin(diffs)
-
-        if diffs[min_idx] <= max_diff:
-            return min_idx
-        return None
-
-    def save_to_hdf5(self, synced_frames: List[Dict], camera_info: Dict,
-                     output_path: str) -> None:
-        """Save synchronized data to HDF5 format."""
-
+    def save_to_hdf5_optimized(self, sync_data: Dict, output_path: str) -> None:
+        """
+        Save synchronized data to HDF5.
+        Direct memory-to-HDF5, no intermediate disk reads.
+        """
         print(f"Saving to HDF5: {output_path}")
+        start_time = time.time()
 
-        if len(synced_frames) == 0:
+        n_frames = sync_data['n_frames']
+        if n_frames == 0:
             print("Error: No frames to save")
             return
 
         with h5py.File(output_path, 'w') as f:
-            # Create episode group
             episode = f.create_group('episode_0000')
 
-            # Prepare arrays
-            n_frames = len(synced_frames)
-            timestamps = np.array([frame['timestamp'] for frame in synced_frames])
-            gripper_observations = np.array([frame['gripper_observation'] for frame in synced_frames])
-            gripper_actions = np.array([frame['gripper_action'] for frame in synced_frames])
+            # Get image dimensions
+            h, w = self.data_store.rgb_images[0].shape[:2]
 
-            # Poses
-            poses = np.zeros((n_frames, 7), dtype=np.float32)
-            for i, frame in enumerate(synced_frames):
-                if frame['pose'] is not None:
-                    poses[i, :3] = frame['pose']['position']
-                    poses[i, 3:] = frame['pose']['quaternion']
-
-            # Read and store images
-            first_rgb = cv2.imread(synced_frames[0]['rgb_path'])
-            h, w = first_rgb.shape[:2]
-
-            rgb_images = episode.create_dataset(
+            # Create datasets
+            rgb_dataset = episode.create_dataset(
                 'rgb_images',
                 shape=(n_frames, h, w, 3),
                 dtype=np.uint8,
-                compression='gzip'
+                compression='gzip',
+                compression_opts=4
             )
 
-            depth_images = episode.create_dataset(
+            depth_dataset = episode.create_dataset(
                 'depth_images',
                 shape=(n_frames, h, w),
                 dtype=np.uint16,
-                compression='gzip'
+                compression='gzip',
+                compression_opts=4
             )
 
-            for i, frame in enumerate(synced_frames):
-                # RGB
-                rgb = cv2.imread(frame['rgb_path'])
-                rgb = cv2.cvtColor(rgb, cv2.COLOR_BGR2RGB)
-                rgb_images[i] = rgb
+            # Write images directly from memory (no disk read!)
+            print("Writing images to HDF5...")
+            depth_indices = sync_data['depth_indices']
 
-                # Depth
-                if frame['depth_path'] and os.path.exists(frame['depth_path']):
-                    depth = cv2.imread(frame['depth_path'], cv2.IMREAD_UNCHANGED)
-                    depth_images[i] = depth
+            for i in range(n_frames):
+                # RGB - already in memory
+                rgb_dataset[i] = self.data_store.rgb_images[i]
 
-                if (i + 1) % 100 == 0:
-                    print(f"  Saved {i + 1}/{n_frames} frames")
+                # Depth - use synced index
+                if depth_indices[i] >= 0:
+                    depth_dataset[i] = self.data_store.depth_images[depth_indices[i]]
 
-            # Store other data
-            episode.create_dataset('timestamps', data=timestamps)
-            episode.create_dataset('camera_pose', data=poses)
-            episode.create_dataset('gripper_width', data=gripper_observations)  # Observation from /joint_states
-            episode.create_dataset('gripper_action', data=gripper_actions)       # Action from /commands
+                if (i + 1) % 200 == 0:
+                    print(f"  Written {i + 1}/{n_frames} frames")
+
+            # Store scalar data
+            episode.create_dataset('timestamps', data=sync_data['timestamps'])
+            episode.create_dataset('camera_pose', data=sync_data['poses'])
+            episode.create_dataset('gripper_width', data=sync_data['gripper_obs'])
+            episode.create_dataset('gripper_action', data=sync_data['gripper_action'])
 
             # Metadata
             meta = f.create_group('metadata')
@@ -693,54 +921,138 @@ class BagProcessor:
             meta.attrs['fps'] = self.config['camera']['fps']
             meta.attrs['num_frames'] = n_frames
 
-            if camera_info:
-                meta.attrs['image_width'] = camera_info['width']
-                meta.attrs['image_height'] = camera_info['height']
-                meta.create_dataset('camera_K', data=np.array(camera_info['K']))
-                if camera_info['D']:
-                    meta.create_dataset('camera_D', data=np.array(camera_info['D']))
+            if self.data_store.camera_info:
+                meta.attrs['image_width'] = self.data_store.camera_info['width']
+                meta.attrs['image_height'] = self.data_store.camera_info['height']
+                meta.create_dataset('camera_K', data=np.array(self.data_store.camera_info['K']))
+                if self.data_store.camera_info['D']:
+                    meta.create_dataset('camera_D', data=np.array(self.data_store.camera_info['D']))
 
-        print(f"Saved {n_frames} frames to {output_path}")
+        elapsed = time.time() - start_time
+        print(f"Saved {n_frames} frames to HDF5 in {elapsed:.1f}s")
+
+    def _run_direct_slam(self) -> List[Dict]:
+        """Run Direct SLAM using pybind11 bindings."""
+        print("Using Direct SLAM (pybind11 bindings)...")
+
+        try:
+            slam_processor = DirectSLAMProcessor(
+                self.vocab_path,
+                self.settings_path
+            )
+            poses = slam_processor.process_frames(self.data_store)
+            slam_processor.shutdown()
+            return poses
+        except Exception as e:
+            print(f"Direct SLAM failed: {e}")
+            import traceback
+            traceback.print_exc()
+            print("Falling back to placeholder poses...")
+            return self.generate_placeholder_poses()
+
+    def save_trajectory_csv(self, poses: List[Dict], output_dir: str) -> None:
+        """Save trajectory to CSV file."""
+        traj_path = os.path.join(output_dir, 'camera_trajectory.csv')
+        with open(traj_path, 'w') as f:
+            f.write('frame_idx,timestamp,x,y,z,qx,qy,qz,qw,is_valid\n')
+            for i, pose in enumerate(poses):
+                is_valid = 1 if pose.get('is_valid', True) else 0
+                f.write(f"{i},{pose['timestamp']:.6f},"
+                       f"{pose['position'][0]:.6f},{pose['position'][1]:.6f},{pose['position'][2]:.6f},"
+                       f"{pose['quaternion'][0]:.6f},{pose['quaternion'][1]:.6f},"
+                       f"{pose['quaternion'][2]:.6f},{pose['quaternion'][3]:.6f},"
+                       f"{is_valid}\n")
+        print(f"Saved trajectory to {traj_path}")
+
+    # ==================== Main Processing Pipeline ====================
 
     def process(self, input_bag: str, output_dir: str) -> str:
-        """Main processing pipeline."""
+        """
+        Main optimized processing pipeline.
 
-        # Create output directory
+        Args:
+            input_bag: Path to ROS2 bag directory
+            output_dir: Output directory for processed data
+
+        Returns:
+            Path to output HDF5 file
+        """
         os.makedirs(output_dir, exist_ok=True)
+        total_start = time.time()
 
-        # Step 1: Extract data from bag
-        print("\n=== Step 1: Extracting data from bag ===")
-        extracted_data = self.extract_data_from_bag(input_bag, output_dir)
+        # Step 1: Extract data to memory
+        print("\n" + "="*60)
+        print("Step 1: Extracting data to memory")
+        print("="*60)
+        self.extract_data_to_memory(input_bag)
 
-        # Step 2: Run offline SLAM
-        print("\n=== Step 2: Running offline SLAM ===")
-        rgb_dir = os.path.join(output_dir, 'rgb')
-        depth_dir = os.path.join(output_dir, 'depth')
-        trajectory = self.run_slam_offline(
-            rgb_dir, depth_dir, output_dir,
-            rgb_data=extracted_data.get('rgb', []),
-            bag_path=input_bag
-        )
+        # Step 2: Run SLAM
+        print("\n" + "="*60)
+        print("Step 2: Running SLAM")
+        print("="*60)
 
-        # Step 3: Synchronize data
-        print("\n=== Step 3: Synchronizing data ===")
-        synced_frames = self.synchronize_data(extracted_data, trajectory)
+        if self.use_ros2_slam:
+            # Use ROS2 bag play + SLAM node (slower, but with visualization option)
+            if RCLPY_AVAILABLE:
+                poses = self.run_slam_with_bag_replay(input_bag)
+                if len(poses) == 0:
+                    print("ROS2 SLAM failed, falling back to Direct SLAM...")
+                    if DIRECT_SLAM_AVAILABLE:
+                        poses = self._run_direct_slam()
+                    else:
+                        raise RuntimeError("Both ROS2 SLAM and Direct SLAM failed")
+            else:
+                print("rclpy not available, using Direct SLAM...")
+                if DIRECT_SLAM_AVAILABLE:
+                    poses = self._run_direct_slam()
+                else:
+                    raise RuntimeError("No SLAM method available")
+        else:
+            # Default: Direct SLAM (fastest, recommended)
+            if DIRECT_SLAM_AVAILABLE:
+                poses = self._run_direct_slam()
+            elif RCLPY_AVAILABLE:
+                print("Direct SLAM not available, falling back to ROS2 SLAM...")
+                poses = self.run_slam_with_bag_replay(input_bag)
+                if len(poses) == 0:
+                    raise RuntimeError("ROS2 SLAM failed and Direct SLAM not available")
+            else:
+                raise RuntimeError("No SLAM method available. Install ORB-SLAM3 Python bindings or rclpy.")
+
+        # Save trajectory
+        self.save_trajectory_csv(poses, output_dir)
+
+        # Step 3: Synchronize data (vectorized)
+        print("\n" + "="*60)
+        print("Step 3: Synchronizing data (vectorized)")
+        print("="*60)
+        sync_data = self.synchronize_data_vectorized(poses)
 
         # Step 4: Save to HDF5
-        print("\n=== Step 4: Saving to HDF5 ===")
+        print("\n" + "="*60)
+        print("Step 4: Saving to HDF5")
+        print("="*60)
         hdf5_path = os.path.join(output_dir, 'dataset.hdf5')
-        self.save_to_hdf5(synced_frames, extracted_data['camera_info'], hdf5_path)
+        self.save_to_hdf5_optimized(sync_data, hdf5_path)
+
+        # Determine SLAM mode used
+        slam_mode = 'ros2_slam' if self.use_ros2_slam else 'direct_slam'
 
         # Save metadata
         metadata = {
             'input_bag': input_bag,
-            'num_frames': len(synced_frames),
+            'num_frames': sync_data['n_frames'],
+            'slam_mode': slam_mode,
+            'valid_poses': int(np.sum(sync_data['valid_poses'])),
             'config': self.config
         }
         with open(os.path.join(output_dir, 'metadata.json'), 'w') as f:
             json.dump(metadata, f, indent=2)
 
-        print("\n=== Processing complete ===")
+        total_elapsed = time.time() - total_start
+        print("\n" + "="*60)
+        print(f"Processing complete in {total_elapsed:.1f}s")
+        print("="*60)
         print(f"Output directory: {output_dir}")
         print(f"HDF5 file: {hdf5_path}")
 
@@ -748,13 +1060,26 @@ class BagProcessor:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Process ROS2 bag with SLAM')
+    parser = argparse.ArgumentParser(
+        description='Optimized ROS2 bag processor with Direct SLAM',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Direct SLAM mode (default, fastest with real poses)
+  python3 process_bag_with_slam.py -i data/raw/session_01 -o data/processed/session_01
+
+  # With ROS2 SLAM visualization (slower)
+  python3 process_bag_with_slam.py -i data/raw/session_01 -o data/processed/session_01 --use-ros2-slam
+        """
+    )
     parser.add_argument('--input', '-i', required=True,
                         help='Input ROS2 bag directory')
     parser.add_argument('--output', '-o', required=True,
                         help='Output directory for processed data')
     parser.add_argument('--config', '-c', default=None,
                         help='Path to config yaml file')
+    parser.add_argument('--use-ros2-slam', action='store_true',
+                        help='Use ROS2 bag play + SLAM node (slower, for visualization)')
 
     args = parser.parse_args()
 
@@ -762,7 +1087,10 @@ def main():
         print(f"Error: Input bag not found: {args.input}")
         sys.exit(1)
 
-    processor = BagProcessor(config_path=args.config)
+    processor = OptimizedBagProcessor(
+        config_path=args.config,
+        use_ros2_slam=args.use_ros2_slam
+    )
     processor.process(args.input, args.output)
 
 
