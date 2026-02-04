@@ -474,6 +474,19 @@ class OptimizedBagProcessor:
 
     # ==================== In-Memory Data Extraction ====================
 
+    def _find_topic(self, available_topics: set, preferred_topic: str, alternatives: List[str] = None) -> Optional[str]:
+        """Find a topic from available topics, trying alternatives if preferred not found."""
+        if preferred_topic in available_topics:
+            return preferred_topic
+
+        if alternatives:
+            for alt in alternatives:
+                if alt in available_topics:
+                    print(f"  Using alternative topic: {alt} (instead of {preferred_topic})")
+                    return alt
+
+        return None
+
     def extract_data_to_memory(self, bag_path: str) -> InMemoryDataStore:
         """
         Extract all data from bag directly into memory.
@@ -487,24 +500,61 @@ class OptimizedBagProcessor:
 
         self.data_store = InMemoryDataStore()
 
-        rgb_topic = self.config['camera']['rgb_topic']
-        depth_topic = self.config['camera']['depth_topic']
-        gripper_action_topic = self.config['gripper']['action_topic']
-        gripper_obs_topic = self.config['gripper']['observation_topic']
-        camera_info_topic = self.config['camera']['camera_info_topic']
-
         with Reader(bag_path) as reader:
             # Get available topics
             available_topics = {conn.topic for conn in reader.connections}
             print(f"Available topics in bag: {available_topics}")
 
+            # Auto-detect RGB topic (try compressed first, then raw)
+            rgb_topic = self._find_topic(
+                available_topics,
+                self.config['camera']['rgb_topic'],
+                alternatives=[
+                    '/camera/camera/color/image_rect_raw',
+                    '/camera/camera/color/image_raw',
+                    '/camera/color/image_raw',
+                ]
+            )
+
+            # Auto-detect Depth topic (try compressed first, then raw)
+            depth_topic = self._find_topic(
+                available_topics,
+                self.config['camera']['depth_topic'],
+                alternatives=[
+                    '/camera/camera/aligned_depth_to_color/image_raw',
+                    '/camera/camera/depth/image_rect_raw',
+                    '/camera/depth/image_rect_raw',
+                ]
+            )
+
+            # Auto-detect Camera info topic
+            camera_info_topic = self._find_topic(
+                available_topics,
+                self.config['camera']['camera_info_topic'],
+                alternatives=[
+                    '/camera/camera/color/camera_info',
+                    '/camera/color/camera_info',
+                ]
+            )
+
+            gripper_action_topic = self.config['gripper']['action_topic']
+            gripper_obs_topic = self.config['gripper']['observation_topic']
+
             # Check which topics exist
             topics_to_read = []
-            for topic in [rgb_topic, depth_topic, gripper_action_topic, gripper_obs_topic, camera_info_topic]:
-                if topic in available_topics:
+            topic_map = {
+                'rgb': rgb_topic,
+                'depth': depth_topic,
+                'gripper_action': gripper_action_topic if gripper_action_topic in available_topics else None,
+                'gripper_obs': gripper_obs_topic if gripper_obs_topic in available_topics else None,
+                'camera_info': camera_info_topic,
+            }
+
+            for name, topic in topic_map.items():
+                if topic:
                     topics_to_read.append(topic)
                 else:
-                    print(f"  Warning: Topic {topic} not found in bag")
+                    print(f"  Warning: No {name} topic found in bag")
 
             print(f"Reading topics: {topics_to_read}")
 
@@ -513,7 +563,7 @@ class OptimizedBagProcessor:
                 topic = conn.topic
                 ts_sec = timestamp / 1e9
 
-                if topic == rgb_topic:
+                if topic == topic_map['rgb']:
                     msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
                     img = self._decode_image_auto(msg, topic)
                     if img is not None:
@@ -522,24 +572,24 @@ class OptimizedBagProcessor:
                         if frame_count % 100 == 0:
                             print(f"  Extracted {frame_count} RGB frames...")
 
-                elif topic == depth_topic:
+                elif topic == topic_map['depth']:
                     msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
                     depth = self._decode_depth_auto(msg, topic)
                     if depth is not None:
                         self.data_store.add_depth(ts_sec, depth)
 
-                elif topic == gripper_action_topic:
+                elif topic == topic_map['gripper_action']:
                     msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
                     width = self._decode_gripper_command(msg)
                     self.data_store.add_gripper_action(ts_sec, width)
 
-                elif topic == gripper_obs_topic:
+                elif topic == topic_map['gripper_obs']:
                     msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
                     width = self._decode_joint_states(msg)
                     if width is not None:
                         self.data_store.add_gripper_obs(ts_sec, width)
 
-                elif topic == camera_info_topic and self.data_store.camera_info is None:
+                elif topic == topic_map['camera_info'] and self.data_store.camera_info is None:
                     msg = typestore.deserialize_cdr(rawdata, conn.msgtype)
                     self.data_store.camera_info = {
                         'width': msg.width,
@@ -1081,7 +1131,23 @@ class OptimizedBagProcessor:
         print("\n" + "="*60)
         print("Step 3: Synchronizing data (vectorized)")
         print("="*60)
+
+        # Check if we have RGB frames
+        if len(self.data_store.rgb_images) == 0:
+            raise RuntimeError(
+                "No RGB frames extracted from bag. "
+                "Check that the bag contains RGB image topics. "
+                f"Available topics may not match expected: {self.config['camera']['rgb_topic']}"
+            )
+
         sync_data = self.synchronize_data_vectorized(poses)
+
+        # Check if synchronization succeeded
+        if sync_data is None or 'n_frames' not in sync_data or sync_data['n_frames'] == 0:
+            raise RuntimeError(
+                "Data synchronization failed. No synchronized frames available. "
+                "Check that RGB, depth, and gripper data are properly extracted."
+            )
 
         # Step 4: Save to HDF5
         print("\n" + "="*60)
