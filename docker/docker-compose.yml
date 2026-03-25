@@ -1,0 +1,58 @@
+services:
+  umi_gripper:
+    container_name: umi_gripper
+    build:
+      context: .
+      dockerfile: Dockerfile
+    tty: true
+    stdin_open: true
+    restart: unless-stopped
+
+    # GPU
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    # Host network (Zenoh discovery with ai_worker) + hardware access
+    network_mode: host
+    ipc: host
+    privileged: true
+
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - HF_HUB_OFFLINE=1
+      - RMW_IMPLEMENTATION=rmw_zenoh_cpp
+      - ROS_DOMAIN_ID=13
+      - PYTHONPATH=/root/ros2_ws/src/umi_gripper_test/third_party/detached-umi-policy
+
+    volumes:
+      # Entire umi_gripper_test repo → ROS2 workspace
+      - ../:/root/ros2_ws/src/umi_gripper_test/
+
+      # Persistent workspace (data, checkpoints, logs - not in git)
+      - ./workspace:/workspace
+
+      # Persist colcon build results across container restarts
+      - ./workspace/build:/root/ros2_ws/build
+      - ./workspace/install:/root/ros2_ws/install
+      - ./workspace/log:/root/ros2_ws/log
+
+      # HuggingFace model cache
+      - ~/.cache/huggingface/:/root/.cache/huggingface/
+
+      # Hardware devices (dynamixel USB, realsense)
+      - /dev:/dev
+      - /dev/shm:/dev/shm
+
+      # Entrypoint (override image copy with latest)
+      - ./entrypoint.sh:/entrypoint.sh:ro
+
+      # X11 forwarding
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw

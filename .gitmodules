@@ -1,6 +1,16 @@
-[submodule "ros2_orb_slam3"]
-	path = ros2_orb_slam3
-	url = ../ros2_orb_slam3
-[submodule "dynamixel_hardware_interface_demos"]
-	path = dynamixel_hardware_interface_demos
-	url = https://github.com/robotis-git/dynamixel_hardware_interface_demos.git
+[submodule "third_party/ros2_orb_slam3"]
+	path = third_party/ros2_orb_slam3
+	url = https://github.com/kimtaehyeong99/ros2_orb_slam3.git
+	branch = feature-umi-gripper
+[submodule "third_party/dynamixel_hardware_interface_demos"]
+	path = third_party/dynamixel_hardware_interface_demos
+	url = https://github.com/ROBOTIS-GIT/dynamixel_hardware_interface_demos.git
+	branch = feature-enhancement
+[submodule "third_party/detached-umi-policy"]
+	path = third_party/detached-umi-policy
+	url = https://github.com/real-stanford/detached-umi-policy.git
+	branch = main
+[submodule "third_party/robotis_motion_controller"]
+	path = third_party/robotis_motion_controller
+	url = https://github.com/ROBOTIS-GIT/robotis_motion_controller.git
+	branch = feature-relpose-test

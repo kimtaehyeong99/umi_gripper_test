@@ -1,0 +1,19 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>umi_model_manager</name>
+  <version>0.1.0</version>
+  <description>UMI model training, inference, and robot deployment</description>
+  <maintainer email="robotis@robotis.com">robotis-ai</maintainer>
+  <license>Apache-2.0</license>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>trajectory_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

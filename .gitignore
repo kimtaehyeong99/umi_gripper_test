@@ -1,0 +1,6 @@
+# Docker workspace (data, checkpoints, build results)
+docker/workspace/
+
+# Python
+__pycache__/
+*.pyc

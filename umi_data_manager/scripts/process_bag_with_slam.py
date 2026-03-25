@@ -317,8 +317,8 @@ class OptimizedBagProcessor:
                 'fps': 30,
             },
             'gripper': {
-                'action_topic': '/gripper_position_controller/commands',
-                'observation_topic': '/joint_states',
+                'action_topic': '/umi/gripper_position_controller/commands',
+                'observation_topic': '/umi/joint_states',
                 'joint_name': 'gripper',
                 'min_position': 0.0,
                 'max_position': 1.0,
@@ -510,6 +510,7 @@ class OptimizedBagProcessor:
                 available_topics,
                 self.config['camera']['rgb_topic'],
                 alternatives=[
+                    '/camera/camera/color/image_rect_raw/compressed',
                     '/camera/camera/color/image_rect_raw',
                     '/camera/camera/color/image_raw',
                     '/camera/color/image_raw',
@@ -521,6 +522,7 @@ class OptimizedBagProcessor:
                 available_topics,
                 self.config['camera']['depth_topic'],
                 alternatives=[
+                    '/camera/camera/aligned_depth_to_color/image_raw/compressedDepth',
                     '/camera/camera/aligned_depth_to_color/image_raw',
                     '/camera/camera/depth/image_rect_raw',
                     '/camera/depth/image_rect_raw',
@@ -735,19 +737,20 @@ class OptimizedBagProcessor:
 
     def run_slam_with_bag_replay(self, bag_path: str) -> List[Dict]:
         """
-        Run SLAM by playing back the bag file and collecting poses.
-        Optimized version with smart initialization instead of hard sleep.
+        Run SLAM by playing back the bag file.
+        Uses subprocess for both SLAM node and bag play.
+        Pose collector runs in this process via rclpy.
+        Requires zenoh daemon (rmw_zenohd) to be running for cross-process communication.
         """
         if not RCLPY_AVAILABLE:
             print("SLAM not available (rclpy not installed)")
             return []
 
-        print("Starting SLAM with bag replay...")
+        import threading
 
         bag_path = str(Path(bag_path).resolve())
         print(f"Bag path: {bag_path}")
 
-        # Initialize rclpy
         rclpy.init()
 
         class PoseCollector(Node):
@@ -755,146 +758,70 @@ class OptimizedBagProcessor:
                 super().__init__('pose_collector')
                 self.poses = []
                 self.subscription = self.create_subscription(
-                    PoseStamped,
-                    '/orb_slam3/camera_pose',
-                    self.pose_callback,
-                    10
-                )
+                    PoseStamped, '/odom/camera_pose', self.pose_callback, 10)
                 self.get_logger().info('Pose collector initialized')
 
             def pose_callback(self, msg):
-                timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9
-                pose_data = {
-                    'timestamp': timestamp,
-                    'position': [
-                        msg.pose.position.x,
-                        msg.pose.position.y,
-                        msg.pose.position.z
-                    ],
-                    'quaternion': [
-                        msg.pose.orientation.x,
-                        msg.pose.orientation.y,
-                        msg.pose.orientation.z,
-                        msg.pose.orientation.w
-                    ]
-                }
-                self.poses.append(pose_data)
-                if len(self.poses) % 100 == 0:
+                ts = msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9
+                self.poses.append({
+                    'timestamp': ts,
+                    'position': [msg.pose.position.x, msg.pose.position.y, msg.pose.position.z],
+                    'quaternion': [msg.pose.orientation.x, msg.pose.orientation.y,
+                                   msg.pose.orientation.z, msg.pose.orientation.w]
+                })
+                if len(self.poses) % 50 == 0:
                     self.get_logger().info(f'Collected {len(self.poses)} poses')
 
         pose_collector = PoseCollector()
-        env = os.environ.copy()
+        spin_thread = threading.Thread(target=rclpy.spin, args=(pose_collector,), daemon=True)
+        spin_thread.start()
 
-        # Get RGB/Depth topics from config
+        # Start SLAM node
         rgb_topic = self.config['camera']['rgb_topic']
         depth_topic = self.config['camera']['depth_topic']
-
-        # Start SLAM node (viewer disabled for subprocess compatibility)
-        slam_cmd = f"ros2 run ros2_orb_slam3 rgbd_node_cpp --ros-args -p settings_name:=RealSense_D405 -p rgb_topic:={rgb_topic} -p depth_topic:={depth_topic} -p enable_viewer:=false"
-        print(f"Starting SLAM: {slam_cmd}")
-
-        slam_process = subprocess.Popen(
-            slam_cmd,
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            preexec_fn=os.setsid
+        slam_cmd = (
+            f"ros2 run ros2_orb_slam3 rgbd_node_cpp --ros-args "
+            f"-p settings_name:=RealSense_D405 "
+            f"-p rgb_topic:={rgb_topic} "
+            f"-p depth_topic:={depth_topic} "
+            f"-p enable_viewer:=false"
         )
+        print(f"Starting SLAM: {slam_cmd}")
+        slam_process = subprocess.Popen(slam_cmd, shell=True, preexec_fn=os.setsid)
 
-        # Smart SLAM initialization check instead of hard 5s sleep
-        print("Waiting for SLAM initialization...")
-        slam_ready = False
-        max_wait = 15  # Maximum 15 seconds
-
-        for i in range(max_wait * 2):  # Check every 0.5s
-            if slam_process.poll() is not None:
-                print(f"WARNING: SLAM process exited with code: {slam_process.poll()}")
-                break
-
-            # Check if SLAM node is publishing
-            try:
-                result = subprocess.run(
-                    ['ros2', 'topic', 'list'],
-                    capture_output=True, text=True, timeout=2
-                )
-                if '/orb_slam3/camera_pose' in result.stdout:
-                    slam_ready = True
-                    print(f"SLAM ready after {(i+1)*0.5:.1f}s")
-                    break
-            except:
-                pass
-
-            time.sleep(0.5)
-
-        if not slam_ready:
-            print("WARNING: SLAM may not be fully initialized, proceeding anyway...")
+        # Wait for SLAM initialization
+        time.sleep(5)
 
         # Start bag replay
-        bag_cmd = f"ros2 bag play {bag_path} --rate 1.0"
+        bag_cmd = f"ros2 bag play {bag_path} --rate 0.5"
         print(f"Starting bag replay: {bag_cmd}")
-
-        bag_process = subprocess.Popen(
-            bag_cmd,
-            shell=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            preexec_fn=os.setsid
-        )
-
-        # Collect poses while bag is playing
-        print("Collecting poses from SLAM...")
+        bag_process = subprocess.Popen(bag_cmd, shell=True, preexec_fn=os.setsid)
 
         try:
-            start_time = time.time()
-            last_pose_count = 0
-
-            while bag_process.poll() is None:
-                rclpy.spin_once(pose_collector, timeout_sec=0.1)
-
-                # Progress update
-                if len(pose_collector.poses) > last_pose_count and len(pose_collector.poses) % 50 == 0:
-                    print(f"  Collected {len(pose_collector.poses)} poses...")
-                    last_pose_count = len(pose_collector.poses)
-
-            elapsed = time.time() - start_time
-            print(f"Bag finished after {elapsed:.1f}s")
-
-            # Brief additional collection for remaining poses
-            print("Collecting remaining poses...")
-            for _ in range(50):  # 5 more seconds
-                rclpy.spin_once(pose_collector, timeout_sec=0.1)
-
+            # Wait for bag to finish
+            bag_process.wait(timeout=120)
+            print(f"Bag finished. Waiting for remaining poses...")
+            time.sleep(3)
+        except subprocess.TimeoutExpired:
+            print("Bag replay timed out")
         except KeyboardInterrupt:
-            print("Interrupted by user")
+            print("Interrupted")
         finally:
-            # Cleanup using process groups
-            print("Cleaning up SLAM processes...")
+            print(f"Collected {len(pose_collector.poses)} poses")
 
-            def kill_process_group(proc, name):
+            for proc in [bag_process, slam_process]:
                 if proc.poll() is None:
                     try:
-                        pgid = os.getpgid(proc.pid)
-                        os.killpg(pgid, signal.SIGTERM)
-                        try:
-                            proc.wait(timeout=5)
-                        except subprocess.TimeoutExpired:
-                            os.killpg(pgid, signal.SIGKILL)
-                            proc.wait(timeout=2)
-                        print(f"  {name} terminated")
-                    except ProcessLookupError:
-                        print(f"  {name} already terminated")
-                    except Exception as e:
-                        print(f"  Error terminating {name}: {e}")
-                else:
-                    print(f"  {name} already finished")
+                        os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+                        proc.wait(timeout=5)
+                    except Exception:
+                        pass
 
-            kill_process_group(slam_process, "SLAM node")
-            kill_process_group(bag_process, "Bag player")
-
+            poses = pose_collector.poses
             pose_collector.destroy_node()
             rclpy.shutdown()
+
+        return poses
 
         print(f"Collected {len(pose_collector.poses)} poses from SLAM")
         return pose_collector.poses

@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>umi_data_manager</name>
+  <version>0.1.0</version>
+  <description>UMI data collection, SLAM processing, and format conversion</description>
+  <maintainer email="robotis@robotis.com">robotis-ai</maintainer>
+  <license>Apache-2.0</license>
+
+  <exec_depend>rclpy</exec_depend>
+  <exec_depend>sensor_msgs</exec_depend>
+  <exec_depend>geometry_msgs</exec_depend>
+  <exec_depend>ros2_orb_slam3</exec_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

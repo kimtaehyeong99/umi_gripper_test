@@ -1,0 +1,44 @@
+umi_policy_bridge:
+  ros__parameters:
+    # ZMQ inference server connection
+    zmq_host: "172.17.0.1"          # Docker host bridge IP
+    zmq_port: 8766
+    zmq_timeout_ms: 5000
+
+    # Observation topics
+    camera_topic: "/camera/camera/color/image_rect_raw"  # base topic (auto-appends /compressed)
+    use_compressed: true              # Subscribe to compressed image topic
+    eef_pose_topic: "/r_gripper_pose"
+    joint_states_topic: "/joint_states"
+    gripper_joint_name: "gripper_r_joint1"
+
+    # Observation settings
+    image_size: [224, 224]
+    n_obs_steps: 2
+    obs_down_sample_steps: 3
+    obs_buffer_hz: 30.0
+
+    # Action topics (must match right_arm_relative_controller config)
+    delta_pose_topic: "/odom/camera_pose"
+    delta_frame_id: "odom"            # Must match controller's base_frame_id
+    gripper_traj_topic: "/leader/joint_trajectory_command_broadcaster_right/raw_joint_trajectory"
+
+    # Action settings
+    n_action_steps: 8
+    action_hz: 30.0                   # Must match right_arm_relative command_hz
+
+    # Safety limits
+    max_pos_delta: 0.05               # 5cm max per action step
+    max_rot_delta: 0.5                # 0.5 rad max per action step
+
+    # Calibration
+    position_scale: 1.0               # Scale factor for workspace size difference
+    gripper_width_to_joint_scale: 13.75   # UMI gripper width (m) -> joint pos (rad)
+    gripper_width_to_joint_offset: 0.0
+
+    # Coordinate frame calibration
+    use_cam_frame: true               # Rotate link7 frame to match SLAM camera orientation
+                                      # (rotation only, no translation offset)
+
+    # Mode
+    dry_run: false                    # If true, only collect observations (no actions)
