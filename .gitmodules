@@ -12,5 +12,5 @@
 	branch = main
 [submodule "third_party/robotis_motion_controller"]
 	path = third_party/robotis_motion_controller
-	url = https://github.com/ROBOTIS-GIT/robotis_motion_controller.git
+	url = https://github.com/ROBOTIS-GIT/cyclo_control.git
 	branch = feature-relpose-test
